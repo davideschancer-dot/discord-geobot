@@ -1,0 +1,6 @@
+.env
+*.pyc
+__pycache__/
+bot_output.log
+redirects.json
+.DS_Store

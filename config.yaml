@@ -1,0 +1,35 @@
+# Discord GEO bot configuration
+# Adding a new country is config-only — no code changes required.
+
+# The primary redirect/router domain.
+router_domain: chancer.bet
+
+# GEOs the bot supports.
+# code: ISO 3166-1 alpha-2 country code
+# name: Human-readable label shown in Discord
+# flag: Emoji flag shown in Discord
+#
+# Note: for `/check-redirect` to work for a GEO, a matching NordVPN
+# server mapping must exist in ec2_setup.sh (SERVER_MAP).
+geos:
+  - code: GR
+    name: Greece
+    flag: "🇬🇷"
+  - code: PL
+    name: Poland
+    flag: "🇵🇱"
+  - code: HU
+    name: Hungary
+    flag: "🇭🇺"
+  - code: DK
+    name: Denmark
+    flag: "🇩🇰"
+  - code: FR
+    name: France
+    flag: "🇫🇷"
+  - code: AE
+    name: UAE
+    flag: "🇦🇪"
+  - code: "NO"
+    name: Norway
+    flag: "🇳🇴"
