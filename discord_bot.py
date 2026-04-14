@@ -10,6 +10,7 @@ Slash commands:
 The redirect check calls an EC2 instance (eu-central-1) that routes
 chancer.bet traffic through a NordVPN Hungary OpenVPN tunnel.
 """
+from __future__ import annotations
 
 import asyncio
 import json
