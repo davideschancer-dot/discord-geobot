@@ -115,6 +115,23 @@ GEO_CHOICES = [
     for code, info in GEO_MAP.items()
 ]
 
+# Auto-delete ephemeral replies after this many seconds so the user's DMs
+# / ephemeral stack doesn't accumulate. Discord itself never expires them.
+EPHEMERAL_TTL_SECONDS = 300  # 5 minutes
+
+
+def _cleanup_ephemeral(interaction: discord.Interaction, delay: int = EPHEMERAL_TTL_SECONDS):
+    """Schedule deletion of this interaction's original ephemeral response."""
+    async def _do_delete():
+        await asyncio.sleep(delay)
+        try:
+            await interaction.delete_original_response()
+        except (discord.NotFound, discord.HTTPException, AttributeError):
+            # Message was already dismissed/deleted or interaction expired — fine.
+            pass
+
+    asyncio.create_task(_do_delete())
+
 
 async def run_check_and_reply(
     interaction: discord.Interaction, geo: str, geo_info: dict
@@ -222,6 +239,7 @@ async def check_redirect(interaction: discord.Interaction, geo: str):
             f"Unknown GEO: `{geo}`. Available: {', '.join(GEO_MAP.keys())}",
             ephemeral=True,
         )
+        _cleanup_ephemeral(interaction)
         return
 
     view = PurgeConfirmView(geo, geo_info)
@@ -230,6 +248,7 @@ async def check_redirect(interaction: discord.Interaction, geo: str):
         view=view,
         ephemeral=True,
     )
+    _cleanup_ephemeral(interaction)
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +262,7 @@ async def redirects(interaction: discord.Interaction):
             "No redirects saved yet. Run `/check-redirect` first.",
             ephemeral=True,
         )
+        _cleanup_ephemeral(interaction)
         return
 
     lines = []
@@ -269,6 +289,7 @@ async def redirect_table(interaction: discord.Interaction):
             "No redirects saved yet. Run `/check-redirect` first.",
             ephemeral=True,
         )
+        _cleanup_ephemeral(interaction)
         return
 
     # Build a fixed-width table
@@ -307,6 +328,7 @@ async def set_redirect(interaction: discord.Interaction, geo: str, mirror: str):
             f"Unknown GEO: `{geo}`. Available: {', '.join(GEO_MAP.keys())}",
             ephemeral=True,
         )
+        _cleanup_ephemeral(interaction)
         return
 
     mirror = mirror.lower().strip()
@@ -352,6 +374,7 @@ async def monitor_check(interaction: discord.Interaction, geo: str, mirror: str)
             f"Unknown GEO: `{code}`. Available: {', '.join(GEO_MAP.keys())}",
             ephemeral=True,
         )
+        _cleanup_ephemeral(interaction)
         return
 
     mirror = mirror.lower().strip()
@@ -389,6 +412,7 @@ async def monitor_status(interaction: discord.Interaction):
             "No GEOs are enabled for monitoring. Set `monitor: true` in `config.yaml`.",
             ephemeral=True,
         )
+        _cleanup_ephemeral(interaction)
         return
 
     parts = [
@@ -436,6 +460,7 @@ async def monitor_status(interaction: discord.Interaction):
     if len(message) > 1900:
         message = message[:1900] + "\n…(truncated)"
     await interaction.response.send_message(message, ephemeral=True)
+    _cleanup_ephemeral(interaction)
 
 
 # ---------------------------------------------------------------------------
@@ -452,12 +477,14 @@ async def trigger_monitor(interaction: discord.Interaction):
         await monitor.run_monitor_cycle(bot)
     except Exception as e:
         await interaction.followup.send(f"Cycle failed: `{e}`", ephemeral=True)
+        _cleanup_ephemeral(interaction)
         return
     await interaction.followup.send(
         "✅ Monitor cycle complete. Check `#alerts` for any new messages, "
         "or use `/monitor-status` to see the latest state.",
         ephemeral=True,
     )
+    _cleanup_ephemeral(interaction)
 
 
 # ---------------------------------------------------------------------------
