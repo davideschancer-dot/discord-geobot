@@ -18,10 +18,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import urllib.parse
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Callable
 
@@ -34,6 +36,25 @@ from dotenv import load_dotenv
 
 load_dotenv()
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# ---------------------------------------------------------------------------
+# Logging — file (rotating) + stdout (journald on EC2)
+# ---------------------------------------------------------------------------
+LOG_DIR = Path(__file__).resolve().parent / "logs"
+LOG_DIR.mkdir(exist_ok=True)
+LOG_FILE = LOG_DIR / "monitor.log"
+
+log = logging.getLogger("geobot")
+log.setLevel(logging.INFO)
+if not log.handlers:
+    _fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    _fh = RotatingFileHandler(LOG_FILE, maxBytes=1_000_000, backupCount=5, encoding="utf-8")
+    _fh.setFormatter(_fmt)
+    log.addHandler(_fh)
+    _sh = logging.StreamHandler()
+    _sh.setFormatter(_fmt)
+    log.addHandler(_sh)
+    log.propagate = False
 
 # ---------------------------------------------------------------------------
 # Paths / config loading
@@ -84,6 +105,9 @@ HEADERS = {
 # ---------------------------------------------------------------------------
 # State
 # ---------------------------------------------------------------------------
+HISTORY_LIMIT = 10
+
+
 @dataclass
 class GeoState:
     status: str = "unknown"              # up | red | orange | unknown
@@ -94,6 +118,20 @@ class GeoState:
     consecutive_failures: int = 0
     last_checked: str | None = None
     last_reason: str | None = None
+    # Rolling log of the last HISTORY_LIMIT check attempts for this GEO.
+    # Each entry: {"at": iso, "mirror": str, "status": str, "reason": str|None}
+    history: list[dict] = field(default_factory=list)
+
+    def record(self, mirror: str, status: str, reason: str | None, at: datetime) -> None:
+        self.history.append({
+            "at": at.isoformat(timespec="seconds"),
+            "mirror": mirror,
+            "status": status,
+            "reason": reason,
+        })
+        # Trim oldest entries.
+        if len(self.history) > HISTORY_LIMIT:
+            self.history = self.history[-HISTORY_LIMIT:]
 
     def to_dict(self) -> dict:
         return {
@@ -105,6 +143,7 @@ class GeoState:
             "consecutive_failures": self.consecutive_failures,
             "last_checked": self.last_checked,
             "last_reason": self.last_reason,
+            "history": self.history,
         }
 
     @classmethod
@@ -363,7 +402,7 @@ async def _send_alert(
     Returns the message_id so state can track it.
     """
     if not ALERT_WEBHOOK_URL:
-        print("[monitor] DISCORD_ALERT_WEBHOOK_URL not set — skipping alert", flush=True)
+        log.warning("DISCORD_ALERT_WEBHOOK_URL not set — skipping alert for %s", code)
         return None
 
     geo_info = GEOS.get(code, {"name": code, "flag": ""})
@@ -389,7 +428,7 @@ async def _send_alert(
             )
             return msg.id
     except Exception as e:
-        print(f"[monitor] Failed to send alert for {code}: {e}", flush=True)
+        log.error("Failed to send alert for %s: %s", code, e)
         return None
 
 
@@ -423,7 +462,7 @@ async def run_monitor_cycle(bot: discord.Client) -> None:
             try:
                 ignored_until = datetime.fromisoformat(gs.ignored_until)
                 if ignored_until > now:
-                    print(f"[monitor] {code} ignored until {gs.ignored_until}, skipping", flush=True)
+                    log.info("%s ignored until %s — skipping", code, gs.ignored_until)
                     continue
                 # Ignore window expired — clear it
                 gs.ignored_until = None
@@ -433,13 +472,13 @@ async def run_monitor_cycle(bot: discord.Client) -> None:
         # Get the mirror from redirects.json
         mirror = (redirects.get(code) or {}).get("mirror")
         if not mirror:
-            print(f"[monitor] {code}: no mirror in redirects.json — skipping", flush=True)
+            log.warning("%s: no mirror in redirects.json — skipping", code)
             continue
 
         # Run the configured check method in a thread
         method = CHECK_METHODS.get(geo["check_method"])
         if not method:
-            print(f"[monitor] {code}: unknown check_method {geo['check_method']}", flush=True)
+            log.error("%s: unknown check_method '%s'", code, geo["check_method"])
             continue
 
         try:
@@ -471,6 +510,8 @@ async def run_monitor_cycle(bot: discord.Client) -> None:
         gs.active_mirror = mirror
         gs.last_checked = now.isoformat(timespec="seconds")
         gs.last_reason = reason
+        # Record the raw check result in per-GEO history (capped).
+        gs.record(mirror=mirror, status=status, reason=reason, at=now)
 
         # Decide whether to fire an alert
         should_alert = False
@@ -503,14 +544,42 @@ async def run_monitor_cycle(bot: discord.Client) -> None:
             if message_id is not None:
                 gs.last_alert_message_id = message_id
 
-        print(
-            f"[monitor] {code} mirror={mirror} check={status} "
-            f"effective={effective_status} fails={gs.consecutive_failures} "
-            f"alert={'yes' if should_alert else 'no'} reason={reason}",
-            flush=True,
+        log.info(
+            "%s mirror=%s check=%s effective=%s fails=%d alert=%s reason=%s",
+            code, mirror, status, effective_status, gs.consecutive_failures,
+            "yes" if should_alert else "no", reason,
         )
 
     state.save()
+
+
+# ---------------------------------------------------------------------------
+# Ad-hoc (independent) check — used by /monitor-check and /trigger-monitor.
+# Does NOT touch monitor_state.json or fire alerts; returns raw result.
+# ---------------------------------------------------------------------------
+async def run_adhoc_check(
+    geo_code: str,
+    mirror: str,
+    check_method: str | None = None,
+) -> tuple[str, str | None]:
+    """Run a single check and return (status, reason). Safe to call from the
+    event loop; wraps the blocking sync check in a thread executor."""
+    code = geo_code.upper()
+    geo = GEOS.get(code)
+    method_name = check_method or (geo["check_method"] if geo else "http")
+    method = CHECK_METHODS.get(method_name)
+    if method is None:
+        return "orange", f"unknown check_method '{method_name}'"
+
+    loop = asyncio.get_running_loop()
+    try:
+        status, reason = await loop.run_in_executor(None, method, code, mirror)
+    except Exception as e:
+        status, reason = "orange", f"{type(e).__name__}: {e}"
+
+    log.info("adhoc-check %s mirror=%s method=%s status=%s reason=%s",
+             code, mirror, method_name, status, reason)
+    return status, reason
 
 
 # ---------------------------------------------------------------------------

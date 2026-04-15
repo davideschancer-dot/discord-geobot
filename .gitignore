@@ -3,4 +3,6 @@
 __pycache__/
 bot_output.log
 redirects.json
+monitor_state.json
+logs/
 .DS_Store

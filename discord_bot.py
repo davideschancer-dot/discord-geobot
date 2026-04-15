@@ -329,6 +329,138 @@ async def set_redirect(interaction: discord.Interaction, geo: str, mirror: str):
 
 
 # ---------------------------------------------------------------------------
+# /monitor-check — ad-hoc health check against any mirror.
+# Does NOT touch monitor state or fire alerts. Used for demo/testing.
+# ---------------------------------------------------------------------------
+_STATUS_EMOJI = {"up": "✅", "red": "🔴", "orange": "🟠", "unknown": "❓"}
+
+
+@tree.command(
+    name="monitor-check",
+    description="Run a one-off health check against any mirror (no state change, no alert)",
+)
+@app_commands.describe(
+    geo="Country code (e.g. HU)",
+    mirror="Mirror domain to test (e.g. chancer6.xyz)",
+)
+@app_commands.choices(geo=GEO_CHOICES)
+async def monitor_check(interaction: discord.Interaction, geo: str, mirror: str):
+    code = geo.upper()
+    geo_info = GEO_MAP.get(code)
+    if not geo_info:
+        await interaction.response.send_message(
+            f"Unknown GEO: `{code}`. Available: {', '.join(GEO_MAP.keys())}",
+            ephemeral=True,
+        )
+        return
+
+    mirror = mirror.lower().strip()
+    if "://" in mirror:
+        mirror = urllib.parse.urlparse(mirror).netloc or mirror
+    mirror = mirror.rstrip("/")
+
+    await interaction.response.defer(thinking=True)
+
+    status, reason = await monitor.run_adhoc_check(code, mirror)
+    emoji = _STATUS_EMOJI.get(status, "❓")
+    method = monitor.GEOS.get(code, {}).get("check_method", "http")
+
+    await interaction.followup.send(
+        f"{emoji} {geo_info['flag']} **{geo_info['name']}** → `{mirror}` via `{method}`\n"
+        f"Status: **{status.upper()}**\n"
+        f"Reason: {reason or '(none — healthy)'}\n"
+        f"_This was a one-off check — monitor state not modified, no alert sent._"
+    )
+
+
+# ---------------------------------------------------------------------------
+# /monitor-status — show current state + recent check attempts per GEO.
+# ---------------------------------------------------------------------------
+@tree.command(
+    name="monitor-status",
+    description="Show current monitor state and recent check attempts",
+)
+async def monitor_status(interaction: discord.Interaction):
+    state = monitor.MonitorState.load()
+    enabled = [c for c, g in monitor.GEOS.items() if g["monitor"]]
+
+    if not enabled:
+        await interaction.response.send_message(
+            "No GEOs are enabled for monitoring. Set `monitor: true` in `config.yaml`.",
+            ephemeral=True,
+        )
+        return
+
+    parts = [
+        f"**Monitor status** — interval: every {monitor.INTERVAL_MINUTES} min, "
+        f"re-alert after {monitor.REALERT_AFTER_HOURS}h\n"
+    ]
+
+    for code in enabled:
+        geo_info = GEO_MAP.get(code, {"name": code, "flag": ""})
+        gs = state.get(code)
+        emoji = _STATUS_EMOJI.get(gs.status, "❓")
+        header = (
+            f"{emoji} {geo_info['flag']} **{geo_info['name']}** "
+            f"— status: `{gs.status}` | mirror: `{gs.active_mirror or '(none)'}`"
+        )
+        extras = []
+        if gs.last_checked:
+            extras.append(f"last checked: {gs.last_checked.replace('T', ' ')}")
+        if gs.consecutive_failures:
+            extras.append(f"consec failures: {gs.consecutive_failures}")
+        if gs.ignored_until:
+            extras.append(f"ignored until: {gs.ignored_until.replace('T', ' ')}")
+        if extras:
+            header += "\n  " + " | ".join(extras)
+        parts.append(header)
+
+        # Last 5 attempts in a compact table
+        recent = list(reversed(gs.history[-5:]))
+        if recent:
+            lines = ["  ```"]
+            lines.append("  Time (UTC)        Mirror              Status  Reason")
+            for h in recent:
+                at = h.get("at", "").replace("T", " ")[:16]
+                mirror_s = (h.get("mirror") or "")[:18].ljust(18)
+                status_s = (h.get("status") or "")[:7].ljust(7)
+                reason_s = (h.get("reason") or "")[:60]
+                lines.append(f"  {at:<17} {mirror_s} {status_s} {reason_s}")
+            lines.append("  ```")
+            parts.append("\n".join(lines))
+        else:
+            parts.append("  _No attempts recorded yet._")
+
+    message = "\n".join(parts)
+    # Discord has a 2000-char limit per message.
+    if len(message) > 1900:
+        message = message[:1900] + "\n…(truncated)"
+    await interaction.response.send_message(message, ephemeral=True)
+
+
+# ---------------------------------------------------------------------------
+# /trigger-monitor — force a monitor cycle now (no need to wait for the tick).
+# Useful for demos and after changing state.
+# ---------------------------------------------------------------------------
+@tree.command(
+    name="trigger-monitor",
+    description="Force a monitor cycle immediately (useful for demos / after /set-redirect)",
+)
+async def trigger_monitor(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    try:
+        await monitor.run_monitor_cycle(bot)
+    except Exception as e:
+        await interaction.followup.send(f"Cycle failed: `{e}`", ephemeral=True)
+        return
+    await interaction.followup.send(
+        "✅ Monitor cycle complete. Check `#alerts` for any new messages, "
+        "or use `/monitor-status` to see the latest state.",
+        ephemeral=True,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Bot lifecycle
 # ---------------------------------------------------------------------------
 # Module-level handle so we only create the monitor task once even if
