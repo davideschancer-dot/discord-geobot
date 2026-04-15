@@ -4,32 +4,70 @@
 # The primary redirect/router domain.
 router_domain: chancer.bet
 
-# GEOs the bot supports.
-# code: ISO 3166-1 alpha-2 country code
-# name: Human-readable label shown in Discord
-# flag: Emoji flag shown in Discord
+# ---------------------------------------------------------------------------
+# Monitor tuning
+# ---------------------------------------------------------------------------
+monitor:
+  # How often the background monitor runs a full check cycle (minutes).
+  interval_minutes: 10
+  # Per-attempt HTTP timeout (seconds).
+  request_timeout: 30
+  # Number of consecutive proxy errors before an ORANGE alert fires.
+  proxy_error_threshold: 3
+  # How long to wait before re-alerting on an unacknowledged outage (hours).
+  realert_after_hours: 4
+  # Ignore button pauses alerts for this GEO for this many hours.
+  ignore_duration_hours: 1
+
+# ---------------------------------------------------------------------------
+# GEOs
+# code:         ISO 3166-1 alpha-2 country code
+# name:         Human-readable label shown in Discord
+# flag:         Emoji flag
+# check_method: how the background monitor tests the mirror in this GEO
+#               http — via Decodo residential proxy (real ISP IPs)
+#               dns  — via RIPE Atlas probes (detects ISP DNS hijack)
+# monitor:      true to include this GEO in the background monitor
+#               (set false to keep the GEO available for /check-redirect
+#               while it's not yet production-ready for alerting)
 #
-# Note: for `/check-redirect` to work for a GEO, a matching NordVPN
-# server mapping must exist in ec2_setup.sh (SERVER_MAP).
+# For /check-redirect to work, a matching NordVPN server mapping must exist
+# in ec2_setup.sh SERVER_MAP. That is independent of `check_method`, which
+# governs health-check monitoring only.
+# ---------------------------------------------------------------------------
 geos:
-  - code: GR
-    name: Greece
-    flag: "🇬🇷"
-  - code: PL
-    name: Poland
-    flag: "🇵🇱"
   - code: HU
     name: Hungary
     flag: "🇭🇺"
+    check_method: http
+    monitor: true
+  - code: GR
+    name: Greece
+    flag: "🇬🇷"
+    check_method: http
+    monitor: false
+  - code: PL
+    name: Poland
+    flag: "🇵🇱"
+    check_method: dns
+    monitor: false
   - code: DK
     name: Denmark
     flag: "🇩🇰"
+    check_method: http
+    monitor: false
   - code: FR
     name: France
     flag: "🇫🇷"
+    check_method: http
+    monitor: false
   - code: AE
     name: UAE
     flag: "🇦🇪"
+    check_method: http
+    monitor: false
   - code: "NO"
     name: Norway
     flag: "🇳🇴"
+    check_method: http
+    monitor: false

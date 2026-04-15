@@ -25,6 +25,8 @@ import yaml
 from discord import app_commands
 from dotenv import load_dotenv
 
+import monitor  # background GEO health monitor (phase 2)
+
 load_dotenv()
 
 # ---------------------------------------------------------------------------
@@ -329,12 +331,36 @@ async def set_redirect(interaction: discord.Interaction, geo: str, mirror: str):
 # ---------------------------------------------------------------------------
 # Bot lifecycle
 # ---------------------------------------------------------------------------
+# Module-level handle so we only create the monitor task once even if
+# on_ready fires again after a reconnect.
+_monitor_task = None
+
+
 @bot.event
 async def on_ready():
+    global _monitor_task
+
     synced = await tree.sync()
     print(f"Bot ready — logged in as {bot.user} (ID: {bot.user.id})", flush=True)
     print(f"Synced {len(synced)} commands: {[c.name for c in synced]}", flush=True)
     print(f"GEOs loaded: {', '.join(GEO_MAP.keys())}", flush=True)
+
+    # Register the persistent alert View so button interactions survive restarts.
+    try:
+        bot.add_view(monitor.AlertView())
+    except Exception as e:
+        print(f"[monitor] Failed to register AlertView: {e}", flush=True)
+
+    # Start the background monitor loop (once).
+    if _monitor_task is None:
+        _monitor_task = monitor.create_monitor_task(bot)
+        _monitor_task.start()
+        enabled = [c for c, g in monitor.GEOS.items() if g["monitor"]]
+        print(
+            f"[monitor] Loop started (interval={monitor.INTERVAL_MINUTES}min). "
+            f"Enabled GEOs: {enabled or 'none'}",
+            flush=True,
+        )
 
 
 if __name__ == "__main__":
