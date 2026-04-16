@@ -1,73 +1,152 @@
 # Discord GEO bot configuration
-# Adding a new country is config-only — no code changes required.
+# Adding a new country is config-only — no code changes required for existing
+# check methods. Adding a new check method means adding a function + entry in
+# monitor.py CHECK_METHODS.
 
 # The primary redirect/router domain.
 router_domain: chancer.bet
+
+# ---------------------------------------------------------------------------
+# Mirror domains — targets monitored for per-GEO accessibility.
+# The "active" mirror per GEO is looked up in redirects.json at check time.
+# ---------------------------------------------------------------------------
+domains:
+  - chancer1.xyz
+  - chancer5.xyz
+  - chancer6.xyz
+  - chancer7.xyz
+  - chancer8.xyz
 
 # ---------------------------------------------------------------------------
 # Monitor tuning
 # ---------------------------------------------------------------------------
 monitor:
   # How often the background monitor runs a full check cycle (minutes).
+  # Per-GEO cadence gating inside the loop decides which GEOs actually run.
   interval_minutes: 10
+
   # Per-attempt HTTP timeout (seconds).
   request_timeout: 30
+
   # Number of consecutive proxy errors before an ORANGE alert fires.
   proxy_error_threshold: 3
+
   # How long to wait before re-alerting on an unacknowledged outage (hours).
   realert_after_hours: 4
+
   # Ignore button pauses alerts for this GEO for this many hours.
   ignore_duration_hours: 1
 
+  # --- Per-method tuning ---
+
+  # HU consensus: all ASNs must agree the mirror is blocked N times in a row.
+  hu_consecutive_failures: 6
+
+  # GR/PL twice-daily schedule (UTC hours).
+  ripe_schedule_hours: [4, 16]
+
+  # GR/PL pending window — attempts and gap between them (minutes).
+  ripe_pending_attempts: 3
+  ripe_pending_gap_minutes: 60
+
+  # DK/NO/FR/AE weekly sweep — day-of-week (Mon=0) and hour UTC.
+  weekly_ripe_dow: 0
+  weekly_ripe_hour: 4
+
 # ---------------------------------------------------------------------------
 # GEOs
-# code:         ISO 3166-1 alpha-2 country code
+# code:         ISO 3166-1 alpha-2
 # name:         Human-readable label shown in Discord
 # flag:         Emoji flag
-# check_method: how the background monitor tests the mirror in this GEO
-#               http — via Decodo residential proxy (real ISP IPs)
-#               dns  — via RIPE Atlas probes (detects ISP DNS hijack)
-# monitor:      true to include this GEO in the background monitor
-#               (set false to keep the GEO available for /check-redirect
-#               while it's not yet production-ready for alerting)
-#
-# For /check-redirect to work, a matching NordVPN server mapping must exist
-# in ec2_setup.sh SERVER_MAP. That is independent of `check_method`, which
-# governs health-check monitoring only.
+# check_method: selects a function from monitor.CHECK_METHODS
+#     http                         — legacy Decodo single-proxy (fallback)
+#     dns                          — legacy placeholder
+#     hu_consensus                 — Decodo all-ASN consensus (HU)
+#     ripe_reliable_asn            — RIPE Atlas from a reliable ISP (GR/PL)
+#     decodo_plus_ripe_confirm     — Decodo http + weekly RIPE + 4-ASN confirm
+# monitor:      include this GEO in the background monitor loop
+# asns:         list of ASNs used by the check method
+#     hu_consensus              — Decodo checks each ASN; ALL must fail.
+#     ripe_reliable_asn         — first ASN is the reliable one; rest are
+#                                 peers used for the "new ASN hijacked"
+#                                 escalation signal.
+#     decodo_plus_ripe_confirm  — ASNs used by the 4-ASN RIPE confirm.
 # ---------------------------------------------------------------------------
 geos:
   - code: HU
     name: Hungary
     flag: "🇭🇺"
-    check_method: http
+    check_method: hu_consensus
     monitor: true
+    asns:
+      - "5483"    # Magyar Telekom
+      - "21334"   # Vodafone Hungary
+      - "20845"   # DIGI Telecommunications
+      - "213155"  # Yettel (formerly Telenor Hungary)
+
   - code: GR
     name: Greece
     flag: "🇬🇷"
-    check_method: http
+    check_method: ripe_reliable_asn
     monitor: false
+    asns:
+      - "1241"    # OTE / Cosmote (RELIABLE — first entry)
+      - "6799"    # Forthnet / Nova
+      - "3329"    # Vodafone Greece
+      - "25472"   # Wind Hellas
+
   - code: PL
     name: Poland
     flag: "🇵🇱"
-    check_method: dns
+    check_method: ripe_reliable_asn
     monitor: false
+    asns:
+      - "5617"    # Orange Polska (RELIABLE — first entry)
+      - "5588"    # GTS / T-Mobile
+      - "12912"   # T-Mobile PL / Era
+      - "29314"   # Vectra
+      - "21021"   # Multimedia Polska
+
   - code: DK
     name: Denmark
     flag: "🇩🇰"
-    check_method: http
+    check_method: decodo_plus_ripe_confirm
     monitor: false
+    asns:
+      - "3292"    # TDC
+      - "3308"    # Telenor DK
+      - "9158"    # Stofa / Norlys
+      - "31027"   # Hiper
+
   - code: FR
     name: France
     flag: "🇫🇷"
-    check_method: http
+    check_method: decodo_plus_ripe_confirm
     monitor: false
+    asns:
+      - "3215"    # Orange FR
+      - "5410"    # Bouygues Telecom
+      - "12322"   # Free / ProXad
+      - "15557"   # SFR
+
   - code: AE
     name: UAE
     flag: "🇦🇪"
-    check_method: http
+    check_method: decodo_plus_ripe_confirm
     monitor: false
+    asns:
+      - "5384"    # Emirates Integrated (EITC / du)
+      - "15412"   # FLAG Telecom (Etisalat intl)
+      - "15802"   # Emirates Telecom (Etisalat)
+      - "45102"   # Alibaba UAE (commercial)
+
   - code: "NO"
     name: Norway
     flag: "🇳🇴"
-    check_method: http
+    check_method: decodo_plus_ripe_confirm
     monitor: false
+    asns:
+      - "2116"    # Uninett / Sikt
+      - "5381"    # Telenor Norway
+      - "12929"   # Telia Norway
+      - "29695"   # Get / Telia
