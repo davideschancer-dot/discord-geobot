@@ -3,12 +3,11 @@ Discord Bot — GEO Redirect Monitor
 ------------------------------------
 Slash commands:
   /check-redirect geo:HU  — Check which mirror chancer.bet redirects to
-                             via EC2 + NordVPN Hungary tunnel.
-  /redirects               — Show current redirect table from redirects.json.
-  /set-redirect geo:HU mirror:chancer8.xyz — Manually set a redirect entry.
+                             via EC2 + NordVPN tunnel.
+  /redirect-status         — Show all known URL redirects.
 
 The redirect check calls an EC2 instance (eu-central-1) that routes
-chancer.bet traffic through a NordVPN Hungary OpenVPN tunnel.
+chancer.bet traffic through a NordVPN OpenVPN tunnel.
 """
 from __future__ import annotations
 
@@ -25,7 +24,7 @@ import yaml
 from discord import app_commands
 from dotenv import load_dotenv
 
-import monitor  # background GEO health monitor (phase 2)
+import monitor
 
 load_dotenv()
 
@@ -117,7 +116,10 @@ GEO_CHOICES = [
 
 # Auto-delete ephemeral replies after this many seconds so the user's DMs
 # / ephemeral stack doesn't accumulate. Discord itself never expires them.
-EPHEMERAL_TTL_SECONDS = 300  # 5 minutes
+EPHEMERAL_TTL_SECONDS = 60  # 1 minute
+
+# Monitor background task handle (set in on_ready)
+_monitor_task = None
 
 
 def _cleanup_ephemeral(interaction: discord.Interaction, delay: int = EPHEMERAL_TTL_SECONDS):
@@ -133,11 +135,36 @@ def _cleanup_ephemeral(interaction: discord.Interaction, delay: int = EPHEMERAL_
     asyncio.create_task(_do_delete())
 
 
+MONITOR_PAUSE_SECONDS = 60  # how long to wait after check before restarting monitor
+
+
+async def _stop_monitor():
+    """Stop the monitor loop if it's running."""
+    global _monitor_task
+    if _monitor_task is not None and _monitor_task.is_running():
+        _monitor_task.cancel()
+        print("[pause-on-check] Monitor stopped", flush=True)
+
+
+async def _restart_monitor_after_delay(delay: int = MONITOR_PAUSE_SECONDS):
+    """Wait, then restart the monitor loop."""
+    global _monitor_task
+    await asyncio.sleep(delay)
+    if _monitor_task is not None and not _monitor_task.is_running():
+        _monitor_task.start()
+        print("[pause-on-check] Monitor restarted", flush=True)
+
+
 async def run_check_and_reply(
     interaction: discord.Interaction, geo: str, geo_info: dict
 ):
-    """Run the redirect check and post the result as a public channel message."""
+    """Run the redirect check and post the result as a public channel message.
+    Pauses the monitor loop during the check to prevent ticking mid-update."""
     try:
+        # 1. Stop the monitor
+        await _stop_monitor()
+
+        # 2. Run the EC2 NordVPN checker
         loop = asyncio.get_running_loop()
         mirror, err = await loop.run_in_executor(None, resolve_mirror_sync, geo)
         now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
@@ -146,8 +173,11 @@ async def run_check_and_reply(
             await interaction.channel.send(
                 f"{geo_info['flag']} **{geo_info['name']}** — Failed to resolve mirror.\n`{err}`"
             )
+            # Still restart monitor even on failure
+            asyncio.create_task(_restart_monitor_after_delay())
             return
 
+        # 3. Write result to redirects.json
         redirects = load_redirects()
         redirects[geo] = {
             "mirror": mirror,
@@ -159,8 +189,13 @@ async def run_check_and_reply(
         await interaction.channel.send(
             f"{geo_info['flag']} **{geo_info['name']}** → `{mirror}` (ec2_vpn, {now[:16].replace('T', ' ')})"
         )
+
+        # 4. Wait 60s then restart the monitor
+        asyncio.create_task(_restart_monitor_after_delay())
+
     except Exception as e:
         await interaction.channel.send(f"Error: `{e}`")
+        asyncio.create_task(_restart_monitor_after_delay())
 
 
 class PurgeConfirmView(discord.ui.View):
@@ -203,11 +238,11 @@ class PurgeConfirmView(discord.ui.View):
         # Let the user know the outcome in the ephemeral message
         if purge_error:
             await interaction.edit_original_response(
-                content=f"⚠️ Could not purge: {purge_error}. Checking {self.geo_info['name']} anyway..."
+                content=f"Could not purge: {purge_error}. Checking {self.geo_info['name']} anyway..."
             )
         else:
             await interaction.edit_original_response(
-                content=f"🗑️ Deleted {deleted_count} messages. Checking {self.geo_info['name']}..."
+                content=f"Deleted {deleted_count} messages. Checking {self.geo_info['name']}..."
             )
 
         await run_check_and_reply(interaction, self.geo, self.geo_info)
@@ -252,13 +287,15 @@ async def check_redirect(interaction: discord.Interaction, geo: str):
 
 
 # ---------------------------------------------------------------------------
-# /redirects
+# /redirect-status
 # ---------------------------------------------------------------------------
-@tree.command(name="redirects", description="Show current GEO redirect table")
-async def redirects(interaction: discord.Interaction):
+@tree.command(name="redirect-status", description="Show all known URL redirects")
+async def redirect_status(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+
     data = load_redirects()
     if not data:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "No redirects saved yet. Run `/check-redirect` first.",
             ephemeral=True,
         )
@@ -275,251 +312,29 @@ async def redirects(interaction: discord.Interaction):
             updated = updated.replace("T", " ")[:16]
         lines.append(f"{geo_info['flag']} {geo_info['name']} → `{mirror}` ({method}, {updated})")
 
-    await interaction.response.send_message("\n".join(lines))
-
-
-# ---------------------------------------------------------------------------
-# /redirect-table
-# ---------------------------------------------------------------------------
-@tree.command(name="redirect-table", description="Show current redirects as a table")
-async def redirect_table(interaction: discord.Interaction):
-    data = load_redirects()
-    if not data:
-        await interaction.response.send_message(
-            "No redirects saved yet. Run `/check-redirect` first.",
-            ephemeral=True,
-        )
-        _cleanup_ephemeral(interaction)
-        return
-
-    # Build a fixed-width table
-    col1_header = "Country"
-    col2_header = "Mirror"
-    rows = []
-    for code, entry in sorted(data.items()):
-        geo_info = GEO_MAP.get(code, {"name": code})
-        rows.append((geo_info["name"], entry.get("mirror", "?")))
-
-    col1_width = max(len(col1_header), *(len(r[0]) for r in rows))
-    col2_width = max(len(col2_header), *(len(r[1]) for r in rows))
-
-    separator = f"+{'-' * (col1_width + 2)}+{'-' * (col2_width + 2)}+"
-    header = f"| {col1_header:<{col1_width}} | {col2_header:<{col2_width}} |"
-    body_lines = [
-        f"| {name:<{col1_width}} | {mirror:<{col2_width}} |"
-        for name, mirror in rows
-    ]
-
-    table = "\n".join([separator, header, separator, *body_lines, separator])
-    await interaction.response.send_message(f"```\n{table}\n```")
-
-
-# ---------------------------------------------------------------------------
-# /set-redirect
-# ---------------------------------------------------------------------------
-@tree.command(name="set-redirect", description="Manually set the redirect mirror for a GEO")
-@app_commands.describe(geo="Country code (e.g. HU)", mirror="Mirror domain (e.g. chancer8.xyz)")
-@app_commands.choices(geo=GEO_CHOICES)
-async def set_redirect(interaction: discord.Interaction, geo: str, mirror: str):
-    geo = geo.upper()
-    geo_info = GEO_MAP.get(geo)
-    if not geo_info:
-        await interaction.response.send_message(
-            f"Unknown GEO: `{geo}`. Available: {', '.join(GEO_MAP.keys())}",
-            ephemeral=True,
-        )
-        _cleanup_ephemeral(interaction)
-        return
-
-    mirror = mirror.lower().strip()
-    if "://" in mirror:
-        mirror = urllib.parse.urlparse(mirror).netloc or mirror
-    mirror = mirror.rstrip("/")
-
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
-    redirects_data = load_redirects()
-    redirects_data[geo] = {
-        "mirror": mirror,
-        "updated": now,
-        "method": "manual",
-    }
-    save_redirects(redirects_data)
-
-    await interaction.response.send_message(
-        f"{geo_info['flag']} **{geo_info['name']}** → `{mirror}` (manual)\nSaved to `redirects.json`."
-    )
-
-
-# ---------------------------------------------------------------------------
-# /monitor-check — ad-hoc health check against any mirror.
-# Does NOT touch monitor state or fire alerts. Used for demo/testing.
-# ---------------------------------------------------------------------------
-_STATUS_EMOJI = {"up": "✅", "red": "🔴", "orange": "🟠", "unknown": "❓"}
-
-
-@tree.command(
-    name="monitor-check",
-    description="Run a one-off health check against any mirror (no state change, no alert)",
-)
-@app_commands.describe(
-    geo="Country code (e.g. HU)",
-    mirror="Mirror domain to test (e.g. chancer6.xyz)",
-)
-@app_commands.choices(geo=GEO_CHOICES)
-async def monitor_check(interaction: discord.Interaction, geo: str, mirror: str):
-    code = geo.upper()
-    geo_info = GEO_MAP.get(code)
-    if not geo_info:
-        await interaction.response.send_message(
-            f"Unknown GEO: `{code}`. Available: {', '.join(GEO_MAP.keys())}",
-            ephemeral=True,
-        )
-        _cleanup_ephemeral(interaction)
-        return
-
-    mirror = mirror.lower().strip()
-    if "://" in mirror:
-        mirror = urllib.parse.urlparse(mirror).netloc or mirror
-    mirror = mirror.rstrip("/")
-
-    await interaction.response.defer(thinking=True)
-
-    status, reason = await monitor.run_adhoc_check(code, mirror)
-    emoji = _STATUS_EMOJI.get(status, "❓")
-    method = monitor.GEOS.get(code, {}).get("check_method", "http")
-
-    await interaction.followup.send(
-        f"{emoji} {geo_info['flag']} **{geo_info['name']}** → `{mirror}` via `{method}`\n"
-        f"Status: **{status.upper()}**\n"
-        f"Reason: {reason or '(none — healthy)'}\n"
-        f"_This was a one-off check — monitor state not modified, no alert sent._"
-    )
-
-
-# ---------------------------------------------------------------------------
-# /monitor-status — show current state + recent check attempts per GEO.
-# ---------------------------------------------------------------------------
-@tree.command(
-    name="monitor-status",
-    description="Show current monitor state and recent check attempts",
-)
-async def monitor_status(interaction: discord.Interaction):
-    state = monitor.MonitorState.load()
-    enabled = [c for c, g in monitor.GEOS.items() if g["monitor"]]
-
-    if not enabled:
-        await interaction.response.send_message(
-            "No GEOs are enabled for monitoring. Set `monitor: true` in `config.yaml`.",
-            ephemeral=True,
-        )
-        _cleanup_ephemeral(interaction)
-        return
-
-    parts = [
-        f"**Monitor status** — interval: every {monitor.INTERVAL_MINUTES} min, "
-        f"re-alert after {monitor.REALERT_AFTER_HOURS}h\n"
-    ]
-
-    for code in enabled:
-        geo_info = GEO_MAP.get(code, {"name": code, "flag": ""})
-        gs = state.get(code)
-        emoji = _STATUS_EMOJI.get(gs.status, "❓")
-        header = (
-            f"{emoji} {geo_info['flag']} **{geo_info['name']}** "
-            f"— status: `{gs.status}` | mirror: `{gs.active_mirror or '(none)'}`"
-        )
-        extras = []
-        if gs.last_checked:
-            extras.append(f"last checked: {gs.last_checked.replace('T', ' ')}")
-        if gs.consecutive_failures:
-            extras.append(f"consec failures: {gs.consecutive_failures}")
-        if gs.ignored_until:
-            extras.append(f"ignored until: {gs.ignored_until.replace('T', ' ')}")
-        if extras:
-            header += "\n  " + " | ".join(extras)
-        parts.append(header)
-
-        # Last 5 attempts in a compact table
-        recent = list(reversed(gs.history[-5:]))
-        if recent:
-            lines = ["  ```"]
-            lines.append("  Time (UTC)        Mirror              Status  Reason")
-            for h in recent:
-                at = h.get("at", "").replace("T", " ")[:16]
-                mirror_s = (h.get("mirror") or "")[:18].ljust(18)
-                status_s = (h.get("status") or "")[:7].ljust(7)
-                reason_s = (h.get("reason") or "")[:60]
-                lines.append(f"  {at:<17} {mirror_s} {status_s} {reason_s}")
-            lines.append("  ```")
-            parts.append("\n".join(lines))
-        else:
-            parts.append("  _No attempts recorded yet._")
-
-    message = "\n".join(parts)
-    # Discord has a 2000-char limit per message.
-    if len(message) > 1900:
-        message = message[:1900] + "\n…(truncated)"
-    await interaction.response.send_message(message, ephemeral=True)
-    _cleanup_ephemeral(interaction)
-
-
-# ---------------------------------------------------------------------------
-# /trigger-monitor — force a monitor cycle now (no need to wait for the tick).
-# Useful for demos and after changing state.
-# ---------------------------------------------------------------------------
-@tree.command(
-    name="trigger-monitor",
-    description="Force a monitor cycle immediately (useful for demos / after /set-redirect)",
-)
-async def trigger_monitor(interaction: discord.Interaction):
-    await interaction.response.defer(thinking=True, ephemeral=True)
-    try:
-        await monitor.run_monitor_cycle(bot)
-    except Exception as e:
-        await interaction.followup.send(f"Cycle failed: `{e}`", ephemeral=True)
-        _cleanup_ephemeral(interaction)
-        return
-    await interaction.followup.send(
-        "✅ Monitor cycle complete. Check `#alerts` for any new messages, "
-        "or use `/monitor-status` to see the latest state.",
-        ephemeral=True,
-    )
-    _cleanup_ephemeral(interaction)
+    await interaction.followup.send("\n".join(lines), ephemeral=True)
 
 
 # ---------------------------------------------------------------------------
 # Bot lifecycle
 # ---------------------------------------------------------------------------
-# Module-level handle so we only create the monitor task once even if
-# on_ready fires again after a reconnect.
-_monitor_task = None
-
-
 @bot.event
 async def on_ready():
     global _monitor_task
+
+    # Register persistent AlertView so buttons survive bot restarts
+    bot.add_view(monitor.AlertView())
 
     synced = await tree.sync()
     print(f"Bot ready — logged in as {bot.user} (ID: {bot.user.id})", flush=True)
     print(f"Synced {len(synced)} commands: {[c.name for c in synced]}", flush=True)
     print(f"GEOs loaded: {', '.join(GEO_MAP.keys())}", flush=True)
 
-    # Register the persistent alert View so button interactions survive restarts.
-    try:
-        bot.add_view(monitor.AlertView())
-    except Exception as e:
-        print(f"[monitor] Failed to register AlertView: {e}", flush=True)
-
-    # Start the background monitor loop (once).
+    # Start the background monitor loop
     if _monitor_task is None:
         _monitor_task = monitor.create_monitor_task(bot)
         _monitor_task.start()
-        enabled = [c for c, g in monitor.GEOS.items() if g["monitor"]]
-        print(
-            f"[monitor] Loop started (interval={monitor.INTERVAL_MINUTES}min). "
-            f"Enabled GEOs: {enabled or 'none'}",
-            flush=True,
-        )
+        print("Monitor task started", flush=True)
 
 
 if __name__ == "__main__":

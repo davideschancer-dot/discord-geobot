@@ -17,9 +17,13 @@ adding a single function to CHECK_METHODS in this file.
 from __future__ import annotations
 
 import asyncio
+import base64
+import concurrent.futures
 import json
 import logging
 import os
+import struct
+import time
 import urllib.parse
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -71,6 +75,7 @@ REQUEST_TIMEOUT = int(MONITOR_CFG.get("request_timeout", 30))
 PROXY_ERROR_THRESHOLD = int(MONITOR_CFG.get("proxy_error_threshold", 3))
 REALERT_AFTER_HOURS = int(MONITOR_CFG.get("realert_after_hours", 4))
 IGNORE_DURATION_HOURS = int(MONITOR_CFG.get("ignore_duration_hours", 1))
+FAILURE_THRESHOLD_HU = int(MONITOR_CFG.get("failure_threshold_hu", 6))
 
 # GEOs keyed by code, including monitor metadata.
 GEOS: dict[str, dict] = {}
@@ -80,20 +85,8 @@ for _g in _cfg.get("geos", []):
         "flag": _g.get("flag", ""),
         "check_method": _g.get("check_method", "http"),
         "monitor": bool(_g.get("monitor", False)),
-        "asns": [str(a) for a in (_g.get("asns") or [])],
+        "asns": _g.get("asns", []),
     }
-
-# Per-method tuning (with defaults that match the previous hardcoded values)
-HU_CONSECUTIVE_FAILURES = int(MONITOR_CFG.get("hu_consecutive_failures", 6))
-RIPE_SCHEDULE_HOURS = list(MONITOR_CFG.get("ripe_schedule_hours", [4, 16]))
-RIPE_PENDING_ATTEMPTS = int(MONITOR_CFG.get("ripe_pending_attempts", 3))
-RIPE_PENDING_GAP_MINUTES = int(MONITOR_CFG.get("ripe_pending_gap_minutes", 60))
-WEEKLY_RIPE_DOW = int(MONITOR_CFG.get("weekly_ripe_dow", 0))
-WEEKLY_RIPE_HOUR = int(MONITOR_CFG.get("weekly_ripe_hour", 4))
-
-# Cloudflare's canonical IP for chancer mirrors — any other resolved IP in a
-# RIPE measurement is treated as an ISP DNS hijack / block page.
-EXPECTED_IP = "104.24.14.93"
 
 # ---------------------------------------------------------------------------
 # Credentials
@@ -103,11 +96,39 @@ PROXY_PORT = os.getenv("PROXY_PORT", "10001")
 PROXY_USERNAME = os.getenv("PROXY_USERNAME")
 PROXY_PASSWORD = os.getenv("PROXY_PASSWORD")
 
-# RIPE Atlas — required for ripe_reliable_asn and decodo_plus_ripe_confirm.
-RIPE_API_KEY = os.getenv("RIPE_API_KEY")
-RIPE_API_BASE = "https://atlas.ripe.net/api/v2"
+RIPE_ATLAS_API_KEY = os.getenv("RIPE_ATLAS_API_KEY")
 
 ALERT_WEBHOOK_URL = os.getenv("DISCORD_ALERT_WEBHOOK_URL")
+
+# Expected Cloudflare IP for mirrors — anything else = DNS hijack
+EXPECTED_IP = "104.24.14.93"
+
+# GR/PL reliable ASN — if this ASN is hijacked, enter pending-confirmation
+RELIABLE_ASN = {
+    "GR": "1241",    # OTE / Cosmote
+    "PL": "5617",    # Orange Polska
+}
+
+# GR/PL pending-confirmation parameters
+PENDING_RETRY_MINUTES = 60
+PENDING_MAX_ATTEMPTS = 3
+
+# RIPE Atlas scheduled check times (UTC hours)
+RIPE_SCHEDULE_HOURS = [4, 16]
+
+# DK/NO/FR/AE — consecutive Decodo failures before 4-ASN RIPE confirmation
+DECODO_FAILURE_THRESHOLD = int(MONITOR_CFG.get("decodo_failure_threshold", 2))
+
+# DK/NO/FR/AE — 4-ASN confirmation sets. ALL four must be 100% hijacked.
+CONFIRM_ASNS = {
+    "DK": ["3292", "3308", "9158", "31027"],     # TDC, Telenor DK, Stofa/Norlys, Hiper
+    "NO": ["2116", "2119", "25400", "29695"],     # Uninett/Sikt, Telenor Norge, BKK, Get/Telia
+    "FR": ["3215", "5410", "12322", "15557"],     # Orange FR, Bouygues, Free/ProXad, SFR
+    "AE": ["5384", "15412", "15802", "45102"],    # du/EITC, FLAG/Etisalat, Etisalat, Alibaba UAE
+}
+
+# UAE block pages are served at these Cloudflare IPs — NOT the real site
+UAE_BLOCK_IPS = {"104.16.130.238", "104.16.131.238"}
 
 HEADERS = {
     "User-Agent": (
@@ -127,7 +148,7 @@ HISTORY_LIMIT = 10
 
 @dataclass
 class GeoState:
-    status: str = "unknown"              # up | red | orange | unknown
+    status: str = "unknown"              # up | red | orange | pending | unknown
     active_mirror: str | None = None     # mirror being monitored
     last_alert_sent: str | None = None   # ISO timestamp
     last_alert_message_id: int | None = None
@@ -135,19 +156,12 @@ class GeoState:
     consecutive_failures: int = 0
     last_checked: str | None = None
     last_reason: str | None = None
-    # --- Per-method extensions ---
-    # Pending confirmation window for ripe_reliable_asn (GR/PL).
+    # GR/PL pending-confirmation window
     pending_confirmation: bool = False
-    pending_first_seen: str | None = None
     pending_attempts: int = 0
-    # Tracks the reliable-ASN IP we observed during pending — used to tell
-    # "still hijacked" from "back to normal".
-    pending_bad_ip: str | None = None
-    # Last twice-daily ripe_reliable_asn check slot (ISO of date+hour) — used
-    # to gate so the scheduled check only runs once per slot.
-    last_ripe_slot: str | None = None
-    # Last weekly RIPE sweep (ISO date) for decodo_plus_ripe_confirm GEOs.
-    last_weekly_ripe: str | None = None
+    pending_first_seen: str | None = None  # ISO timestamp
+    last_blocked_asns: list[str] = field(default_factory=list)
+    alert_fired: bool = False              # True = alert sent for this outage
     # Rolling log of the last HISTORY_LIMIT check attempts for this GEO.
     # Each entry: {"at": iso, "mirror": str, "status": str, "reason": str|None}
     history: list[dict] = field(default_factory=list)
@@ -159,9 +173,24 @@ class GeoState:
             "status": status,
             "reason": reason,
         })
-        # Trim oldest entries.
         if len(self.history) > HISTORY_LIMIT:
             self.history = self.history[-HISTORY_LIMIT:]
+
+    def clear_pending(self) -> None:
+        """Reset pending-confirmation state (used on recovery or after alert)."""
+        self.pending_confirmation = False
+        self.pending_attempts = 0
+        self.pending_first_seen = None
+        self.last_blocked_asns = []
+
+    def clear_outage(self) -> None:
+        """Silently clear all outage state (no 'up' notification sent)."""
+        self.status = "up"
+        self.consecutive_failures = 0
+        self.alert_fired = False
+        self.last_alert_sent = None
+        self.last_alert_message_id = None
+        self.clear_pending()
 
     def to_dict(self) -> dict:
         return {
@@ -174,17 +203,15 @@ class GeoState:
             "last_checked": self.last_checked,
             "last_reason": self.last_reason,
             "pending_confirmation": self.pending_confirmation,
-            "pending_first_seen": self.pending_first_seen,
             "pending_attempts": self.pending_attempts,
-            "pending_bad_ip": self.pending_bad_ip,
-            "last_ripe_slot": self.last_ripe_slot,
-            "last_weekly_ripe": self.last_weekly_ripe,
+            "pending_first_seen": self.pending_first_seen,
+            "last_blocked_asns": self.last_blocked_asns,
+            "alert_fired": self.alert_fired,
             "history": self.history,
         }
 
     @classmethod
     def from_dict(cls, d: dict) -> "GeoState":
-        # Only accept keys that match dataclass fields; defaults fill the rest.
         kwargs = {k: d[k] for k in cls.__dataclass_fields__ if k in d}
         return cls(**kwargs)
 
@@ -320,245 +347,333 @@ def _evaluate_http_response(mirror: str, resp) -> tuple[str, str | None]:
 
 
 def check_dns(geo_code: str, mirror: str) -> tuple[str, str | None]:
-    """Legacy placeholder — use ripe_reliable_asn or decodo_plus_ripe_confirm."""
+    """
+    DNS check via RIPE Atlas probes — not yet implemented.
+    Poland phase will implement this: detects ISP DNS hijack by comparing
+    resolved IP to the real Cloudflare IP 104.24.14.93.
+    """
     return "orange", "DNS check method not yet implemented for this GEO"
 
 
-# ---------------------------------------------------------------------------
-# Decodo — per-ASN targeted proxy request.
-# Decodo residential gateways let you target a specific ASN via the
-# "user-{user}-asn-{asn}" username format. All 4 HU ASNs can be polled
-# and required to agree before we call the mirror "down".
-# ---------------------------------------------------------------------------
-def _decodo_asn_check(asn: str, mirror: str) -> tuple[str, str | None]:
-    """Fetch https://<mirror>/ via Decodo routed through ASN {asn}."""
+def _check_single_asn(geo_code: str, mirror: str, asn: str) -> tuple[str, str | None, str]:
+    """
+    Run a Decodo HTTP check routed through a specific ASN.
+    Returns (status, reason, asn).
+    """
     if not PROXY_USERNAME or not PROXY_PASSWORD:
-        return "orange", "PROXY_USERNAME/PASSWORD not set"
-    proxy_url = f"http://user-{PROXY_USERNAME}-asn-{asn}:{PROXY_PASSWORD}@{PROXY_HOST}:{PROXY_PORT}"
+        return "orange", "PROXY_USERNAME/PASSWORD not set", asn
+
+    cc = geo_code.lower()
+    proxy_url = (
+        f"http://user-{PROXY_USERNAME}-country-{cc}-asn-{asn}"
+        f":{PROXY_PASSWORD}@{PROXY_HOST}:{PROXY_PORT}"
+    )
     proxies = {"http": proxy_url, "https": proxy_url}
     url = f"https://{mirror}"
-    try:
-        resp = requests.get(
-            url, proxies=proxies, timeout=REQUEST_TIMEOUT,
-            allow_redirects=True, headers=HEADERS, verify=False,
-        )
-        return _evaluate_http_response(mirror, resp)
-    except requests.exceptions.SSLError as e:
-        return "red", f"SSL reset on AS{asn}: {str(e)[:80]}"
-    except requests.exceptions.ProxyError as e:
-        return "orange", f"Proxy error AS{asn}: {str(e)[:80]}"
-    except requests.exceptions.Timeout:
-        return "red", f"Timeout on AS{asn}"
-    except requests.exceptions.ConnectionError as e:
-        return "red", f"Connection error AS{asn}: {str(e)[:80]}"
-    except Exception as e:
-        return "orange", f"Error AS{asn}: {type(e).__name__}: {str(e)[:80]}"
+
+    last_exception: Exception | None = None
+    for attempt in range(3):
+        try:
+            resp = requests.get(
+                url,
+                proxies=proxies,
+                timeout=REQUEST_TIMEOUT,
+                allow_redirects=True,
+                headers=HEADERS,
+                verify=False,
+            )
+            status, reason = _evaluate_http_response(mirror, resp)
+            return status, reason, asn
+        except requests.exceptions.SSLError as e:
+            last_exception = e
+        except requests.exceptions.ProxyError as e:
+            last_exception = e
+        except requests.exceptions.Timeout as e:
+            last_exception = e
+        except requests.exceptions.ConnectionError as e:
+            last_exception = e
+        except Exception as e:
+            last_exception = e
+            break
+
+    if isinstance(last_exception, requests.exceptions.SSLError):
+        return "red", f"SSL error — ISP connection reset: {str(last_exception)[:120]}", asn
+    if isinstance(last_exception, requests.exceptions.ProxyError):
+        return "orange", f"Proxy error: {str(last_exception)[:120]}", asn
+    if isinstance(last_exception, requests.exceptions.Timeout):
+        return "red", "Request timed out after retries", asn
+    return "red", f"Connection error: {str(last_exception)[:120]}", asn
 
 
-# ---------------------------------------------------------------------------
-# HU consensus — all 4 ASNs must report red, else "up".
-# ---------------------------------------------------------------------------
 def check_hu_consensus(geo_code: str, mirror: str) -> tuple[str, str | None]:
+    """
+    Hungary all-ASN consensus check. Runs each configured ASN in parallel
+    via ThreadPoolExecutor. Returns a synthetic status:
+      - "blocked" if ALL ASNs report the mirror as blocked (red)
+      - "up" if at least one ASN sees it as accessible
+      - "inconclusive" if results are mixed proxy errors / unknowns
+    The caller (run_monitor_cycle) handles the 6-cycle threshold.
+    """
     asns = GEOS.get(geo_code, {}).get("asns", [])
     if not asns:
-        return "orange", "No ASNs configured for HU consensus"
+        return check_http(geo_code, mirror)
 
-    from concurrent.futures import ThreadPoolExecutor
-    results: dict[str, tuple[str, str | None]] = {}
-    with ThreadPoolExecutor(max_workers=len(asns)) as pool:
-        futures = {pool.submit(_decodo_asn_check, a, mirror): a for a in asns}
-        for fut in futures:
-            a = futures[fut]
-            try:
-                results[a] = fut.result(timeout=REQUEST_TIMEOUT + 5)
-            except Exception as e:
-                results[a] = ("orange", f"exec error: {e}")
+    log.info("HU consensus check: %s across ASNs %s", mirror, asns)
 
-    reds = [a for a, (s, _) in results.items() if s == "red"]
-    oranges = [a for a, (s, _) in results.items() if s == "orange"]
-    ups = [a for a, (s, _) in results.items() if s == "up"]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(asns)) as pool:
+        futures = {
+            pool.submit(_check_single_asn, geo_code, mirror, asn): asn
+            for asn in asns
+        }
+        results: list[tuple[str, str | None, str]] = []
+        for fut in concurrent.futures.as_completed(futures):
+            results.append(fut.result())
 
-    detail = ", ".join(f"AS{a}={s}" for a, (s, _) in results.items())
+    blocked = [r for r in results if r[0] == "red"]
+    up = [r for r in results if r[0] == "up"]
+    orange = [r for r in results if r[0] == "orange"]
 
-    # All must be red for a confirmed block.
-    if len(reds) == len(asns):
-        return "red", f"All {len(asns)} HU ASNs blocked — {detail}"
-    # Any UP = definitively not a nationwide block.
-    if ups:
+    for status, reason, asn in results:
+        log.info("  ASN %s: %s — %s", asn, status, reason or "OK")
+
+    if up:
         return "up", None
-    # Mix of red + orange (proxy errors) — inconclusive, escalate to orange.
-    return "orange", f"HU consensus inconclusive — {detail}"
+    if len(blocked) == len(asns):
+        reasons = [f"AS{r[2]}: {r[1]}" for r in blocked]
+        return "blocked", f"All {len(asns)} ASNs blocked — {'; '.join(reasons)}"
+    # Mixed: some proxy errors, some blocked — don't count as failure
+    return "inconclusive", f"Mixed results: {len(blocked)} blocked, {len(orange)} proxy errors"
 
 
 # ---------------------------------------------------------------------------
-# RIPE Atlas — DNS measurements targeted at specific ASNs.
+# RIPE Atlas DNS measurement client
 # ---------------------------------------------------------------------------
-def _ripe_create_dns_measurement(mirror: str, cc: str, asn: str | None = None) -> int | None:
-    """Create a one-off DNS A measurement. Returns measurement ID, or None."""
-    if not RIPE_API_KEY:
-        log.warning("RIPE_API_KEY not set — cannot create measurement")
+RIPE_API_BASE = "https://atlas.ripe.net/api/v2"
+
+
+def _ripe_create_measurement(
+    domain: str,
+    country_code: str,
+    asn: str,
+    probe_count: int = 5,
+) -> int | None:
+    """
+    Create a one-off RIPE Atlas DNS A-record measurement for `domain`,
+    targeting probes in `country_code` on `asn`. Returns measurement ID.
+    """
+    if not RIPE_ATLAS_API_KEY:
+        log.warning("RIPE_ATLAS_API_KEY not set — cannot create measurement")
         return None
-
-    probe_spec: dict = {"requested": 5, "type": "country", "value": cc.upper()}
-    if asn:
-        probe_spec = {"requested": 5, "type": "asn", "value": str(asn)}
 
     payload = {
         "definitions": [{
-            "target": mirror,
-            "description": f"chancer {cc} {'AS'+asn if asn else 'country'}",
             "type": "dns",
             "af": 4,
             "query_class": "IN",
             "query_type": "A",
-            "query_argument": mirror,
+            "query_argument": domain,
             "use_probe_resolver": True,
+            "description": f"GEO monitor: {domain} from AS{asn} in {country_code}",
+            "use_macros": False,
+            "protocol": "UDP",
+            "udp_payload_size": 512,
+            "set_rd_bit": True,
             "is_oneoff": True,
-            "resolve_on_probe": True,
         }],
-        "probes": [probe_spec],
+        "probes": [{
+            "requested": probe_count,
+            "type": "asn",
+            "value": str(asn),
+            "tags": {"include": [], "exclude": []},
+        }],
     }
+
     try:
         resp = requests.post(
-            f"{RIPE_API_BASE}/measurements/?key={RIPE_API_KEY}",
-            json=payload, timeout=30,
+            f"{RIPE_API_BASE}/measurements/",
+            json=payload,
+            headers={"Authorization": f"Key {RIPE_ATLAS_API_KEY}"},
+            timeout=30,
         )
-        if resp.status_code not in (200, 201):
-            log.error("RIPE create failed (%s AS%s): %s %s",
-                      cc, asn, resp.status_code, resp.text[:200])
+        if resp.status_code in (200, 201):
+            data = resp.json()
+            msm_id = data.get("measurements", [None])[0]
+            log.info("RIPE measurement created: %s (AS%s in %s)", msm_id, asn, country_code)
+            return msm_id
+        else:
+            log.error("RIPE create failed: HTTP %d — %s", resp.status_code, resp.text[:200])
             return None
-        return resp.json().get("measurements", [None])[0]
     except Exception as e:
-        log.error("RIPE create exception: %s", e)
+        log.error("RIPE create error: %s", e)
         return None
 
 
-def _ripe_fetch_results(measurement_id: int, wait_seconds: int = 600) -> list[dict]:
-    """Poll a RIPE measurement's results until it stops changing or times out."""
-    import time as _time
-    deadline = _time.time() + wait_seconds
-    last = []
-    while _time.time() < deadline:
+def _ripe_poll_results(
+    measurement_id: int,
+    max_wait: int = 120,
+    poll_interval: int = 10,
+) -> list[dict]:
+    """
+    Poll a RIPE Atlas measurement until results arrive or timeout.
+    Returns list of result dicts.
+    """
+    deadline = time.monotonic() + max_wait
+    while time.monotonic() < deadline:
         try:
             resp = requests.get(
                 f"{RIPE_API_BASE}/measurements/{measurement_id}/results/",
-                timeout=30,
+                timeout=15,
             )
             if resp.status_code == 200:
-                data = resp.json()
-                if isinstance(data, list) and len(data) >= 3:
-                    # 3+ probe results is enough signal for our ASN checks.
-                    return data
-                last = data if isinstance(data, list) else last
+                results = resp.json()
+                if results:
+                    return results
         except Exception as e:
-            log.warning("RIPE fetch %s: %s", measurement_id, e)
-        _time.sleep(15)
-    return last
+            log.warning("RIPE poll error for %d: %s", measurement_id, e)
+        time.sleep(poll_interval)
+    log.warning("RIPE measurement %d timed out after %ds", measurement_id, max_wait)
+    return []
 
 
-def _ripe_extract_ips(result: dict) -> list[str]:
-    """Parse DNS A records out of a single RIPE DNS result row."""
-    ips: list[str] = []
-    for rk in ("resultset", "result"):
-        entries = result.get(rk) or []
-        if not isinstance(entries, list):
-            entries = [entries]
-        for entry in entries:
-            for ans in (entry.get("answers") or []):
+def _parse_abuf_ips(abuf_b64: str) -> list[str]:
+    """Extract A-record IPs from a base64-encoded DNS response buffer."""
+    try:
+        buf = base64.b64decode(abuf_b64)
+        if len(buf) < 12:
+            return []
+        qdcount = struct.unpack("!H", buf[4:6])[0]
+        ancount = struct.unpack("!H", buf[6:8])[0]
+        # Skip question section
+        offset = 12
+        for _ in range(qdcount):
+            while offset < len(buf):
+                length = buf[offset]
+                if length == 0:
+                    offset += 1
+                    break
+                if length >= 192:  # compression pointer
+                    offset += 2
+                    break
+                offset += 1 + length
+            offset += 4  # QTYPE + QCLASS
+        # Parse answer records
+        ips = []
+        for _ in range(ancount):
+            if offset >= len(buf):
+                break
+            # Skip NAME (may be compressed)
+            if buf[offset] >= 192:
+                offset += 2
+            else:
+                while offset < len(buf):
+                    length = buf[offset]
+                    if length == 0:
+                        offset += 1
+                        break
+                    if length >= 192:
+                        offset += 2
+                        break
+                    offset += 1 + length
+            if offset + 10 > len(buf):
+                break
+            rtype, _, _, rdlength = struct.unpack("!HHIH", buf[offset:offset + 10])
+            offset += 10
+            if rtype == 1 and rdlength == 4:  # A record
+                ips.append(".".join(str(b) for b in buf[offset:offset + 4]))
+            offset += rdlength
+        return ips
+    except Exception:
+        return []
+
+
+def _ripe_extract_ips(results: list[dict]) -> list[str]:
+    """Extract resolved A-record IPs from RIPE Atlas DNS measurement results."""
+    ips = []
+    for result in results:
+        # RIPE results use "resultset" (array of sub-measurements per probe)
+        resultset = result.get("resultset") or []
+        if not resultset:
+            # Fallback: single "result" dict at top level
+            r = result.get("result")
+            if isinstance(r, dict):
+                resultset = [{"result": r}]
+        for entry in resultset:
+            if not isinstance(entry, dict):
+                continue
+            sub = entry.get("result", {})
+            if not isinstance(sub, dict):
+                continue
+            # Primary: decode abuf (base64 DNS wire format)
+            abuf = sub.get("abuf")
+            if abuf:
+                ips.extend(_parse_abuf_ips(abuf))
+                continue
+            # Fallback: pre-decoded answers (some older probe firmware)
+            for ans in sub.get("answers", []):
                 if ans.get("TYPE") == "A" and ans.get("RDATA"):
-                    rd = ans["RDATA"]
-                    if isinstance(rd, list):
-                        ips.extend(rd)
-                    else:
-                        ips.append(rd)
+                    ips.append(ans["RDATA"])
     return ips
 
 
-def _ripe_hijack_rate(results: list[dict]) -> tuple[float, int, int]:
-    """Return (hijack_rate, hijacked_count, total). 1.0 = all probes hijacked."""
-    total = 0
-    hijacked = 0
-    for r in results:
-        ips = _ripe_extract_ips(r)
-        if not ips:
-            continue
-        total += 1
-        if EXPECTED_IP not in ips:
-            hijacked += 1
-    rate = (hijacked / total) if total else 0.0
-    return rate, hijacked, total
+def ripe_check_asn(
+    domain: str,
+    country_code: str,
+    asn: str,
+) -> dict:
+    """
+    Run a RIPE Atlas DNS check for a single ASN.
+    Returns {"asn": str, "hijacked": bool, "ips": list[str], "error": str|None}
+    """
+    msm_id = _ripe_create_measurement(domain, country_code, asn)
+    if msm_id is None:
+        return {"asn": asn, "hijacked": False, "ips": [], "error": "Failed to create measurement"}
 
-
-def _ripe_run_asn(mirror: str, cc: str, asn: str) -> tuple[float, int, int, str | None]:
-    """Run a per-ASN RIPE DNS measurement. Returns (rate, hijacked, total, err)."""
-    mid = _ripe_create_dns_measurement(mirror, cc, asn)
-    if not mid:
-        return 0.0, 0, 0, "RIPE create failed"
-    results = _ripe_fetch_results(mid, wait_seconds=600)
+    results = _ripe_poll_results(msm_id)
     if not results:
-        return 0.0, 0, 0, f"No RIPE results for measurement {mid}"
-    rate, hj, tot = _ripe_hijack_rate(results)
-    return rate, hj, tot, None
+        return {"asn": asn, "hijacked": False, "ips": [], "error": "No results returned"}
+
+    ips = _ripe_extract_ips(results)
+    if not ips:
+        return {"asn": asn, "hijacked": False, "ips": [], "error": "No A records resolved"}
+
+    # Any IP that differs from expected = hijacked
+    hijacked = any(ip != EXPECTED_IP for ip in ips)
+    return {"asn": asn, "hijacked": hijacked, "ips": list(set(ips)), "error": None}
 
 
-# ---------------------------------------------------------------------------
-# GR/PL — ripe_reliable_asn
-# The first ASN in geo.asns is the RELIABLE one (OTE/Cosmote, Orange PL).
-# If that ASN resolves to anything other than EXPECTED_IP, we open a pending
-# window. The window needs RIPE_PENDING_ATTEMPTS confirmations (spaced by
-# RIPE_PENDING_GAP_MINUTES) before we report red.
-#
-# This function is *stateless* — it only returns the "current reliable-ASN
-# observation". run_monitor_cycle holds the pending window state.
-# ---------------------------------------------------------------------------
-def check_ripe_reliable_asn(geo_code: str, mirror: str) -> tuple[str, str | None]:
-    asns = GEOS.get(geo_code, {}).get("asns", [])
-    if not asns:
-        return "orange", f"No ASNs configured for {geo_code}"
-    reliable = asns[0]
-    rate, hj, tot, err = _ripe_run_asn(mirror, geo_code, reliable)
-    if err:
-        return "orange", f"AS{reliable} RIPE error: {err}"
-    if tot == 0:
-        return "orange", f"AS{reliable} RIPE returned no probes"
-    if rate >= 1.0:
-        return "red", f"AS{reliable} 100% hijacked ({hj}/{tot} probes, expected {EXPECTED_IP})"
-    if rate > 0:
-        return "orange", f"AS{reliable} partial hijack {hj}/{tot}"
-    return "up", None
+def ripe_check_per_asn(
+    domain: str,
+    country_code: str,
+    asns: list[str],
+) -> dict:
+    """
+    Run RIPE Atlas DNS checks across multiple ASNs in parallel.
+    Returns {
+        "per_asn": {asn: {hijacked, ips, error}},
+        "hijacked_asns": [asn, ...],
+        "all_hijacked": bool,
+    }
+    """
+    log.info("RIPE per-ASN check: %s in %s across ASNs %s", domain, country_code, asns)
+    per_asn = {}
 
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(asns)) as pool:
+        futures = {
+            pool.submit(ripe_check_asn, domain, country_code, asn): asn
+            for asn in asns
+        }
+        for fut in concurrent.futures.as_completed(futures):
+            result = fut.result()
+            per_asn[result["asn"]] = result
+            log.info("  RIPE AS%s: hijacked=%s ips=%s err=%s",
+                     result["asn"], result["hijacked"], result["ips"], result["error"])
 
-# ---------------------------------------------------------------------------
-# DK/NO/FR/AE — decodo_plus_ripe_confirm
-# Decodo HTTP is the primary signal (runs every cycle). When the primary
-# crosses the failure threshold, we escalate to the 4-ASN RIPE confirm —
-# ALL configured ASNs must be 100% hijacked for us to report red.
-# run_monitor_cycle triggers _run_4asn_confirm when needed.
-# ---------------------------------------------------------------------------
-def _run_4asn_confirm(geo_code: str, mirror: str) -> tuple[str, str | None]:
-    asns = GEOS.get(geo_code, {}).get("asns", [])
-    if not asns:
-        return "orange", f"No ASNs configured for {geo_code} confirm"
-    from concurrent.futures import ThreadPoolExecutor
-    per_asn: dict[str, tuple[float, int, int, str | None]] = {}
-    with ThreadPoolExecutor(max_workers=min(4, len(asns))) as pool:
-        futs = {pool.submit(_ripe_run_asn, mirror, geo_code, a): a for a in asns}
-        for fut in futs:
-            a = futs[fut]
-            try:
-                per_asn[a] = fut.result(timeout=720)
-            except Exception as e:
-                per_asn[a] = (0.0, 0, 0, f"exec: {e}")
-    fully = [a for a, (r, _, t, e) in per_asn.items() if e is None and t > 0 and r >= 1.0]
-    detail = ", ".join(f"AS{a}={int(r*100)}%" for a, (r, _, _, _) in per_asn.items())
-    if len(fully) == len(asns):
-        return "red", f"All {len(asns)} ASNs 100% hijacked — {detail}"
-    return "up", f"4-ASN confirm negative — {detail}"
-
-
-def check_decodo_plus_ripe_confirm(geo_code: str, mirror: str) -> tuple[str, str | None]:
-    """Primary fast path: same as check_http (Decodo country-level proxy)."""
-    return check_http(geo_code, mirror)
+    hijacked_asns = [asn for asn, r in per_asn.items() if r["hijacked"]]
+    return {
+        "per_asn": per_asn,
+        "hijacked_asns": hijacked_asns,
+        "all_hijacked": len(hijacked_asns) == len(asns) and len(asns) > 0,
+    }
 
 
 # Registry — adding a new check method is just a new function + entry here.
@@ -566,8 +681,6 @@ CHECK_METHODS: dict[str, Callable[[str, str], tuple[str, str | None]]] = {
     "http": check_http,
     "dns": check_dns,
     "hu_consensus": check_hu_consensus,
-    "ripe_reliable_asn": check_ripe_reliable_asn,
-    "decodo_plus_ripe_confirm": check_decodo_plus_ripe_confirm,
 }
 
 
@@ -705,6 +818,84 @@ async def _send_alert(
 
 
 # ---------------------------------------------------------------------------
+# Shared alert helpers
+# ---------------------------------------------------------------------------
+def _should_alert(gs: GeoState, prev_status: str, now: datetime) -> bool:
+    """Determine if an alert should fire based on state transition and re-alert window."""
+    effective = gs.status
+    if effective not in ("red", "orange"):
+        return False
+    if prev_status != effective:
+        return True
+    if gs.last_alert_sent:
+        try:
+            last = datetime.fromisoformat(gs.last_alert_sent)
+            if (now - last).total_seconds() >= REALERT_AFTER_HOURS * 3600:
+                return True
+        except ValueError:
+            return True
+    elif not gs.last_alert_sent:
+        return True
+    return False
+
+
+async def _run_4asn_confirm(
+    bot: discord.Client,
+    code: str,
+    mirror: str,
+    gs: GeoState,
+    state: "MonitorState",
+    trigger: str,
+) -> None:
+    """
+    Run 4-ASN RIPE confirmation for DK/NO/FR/AE. Only alerts if ALL
+    configured confirm ASNs show 100% DNS hijack.
+    """
+    asns = CONFIRM_ASNS.get(code, [])
+    if not asns:
+        log.warning("[%s] No CONFIRM_ASNS defined — cannot confirm", code)
+        return
+
+    if not RIPE_ATLAS_API_KEY:
+        log.warning("[%s] RIPE_ATLAS_API_KEY not set — cannot run 4-ASN confirm", code)
+        return
+
+    log.info("[%s] Running 4-ASN RIPE confirm (%s) — ASNs %s", code, trigger, asns)
+    now = datetime.now(timezone.utc)
+
+    loop = asyncio.get_running_loop()
+    summary = await loop.run_in_executor(
+        None, ripe_check_per_asn, mirror, code, asns
+    )
+
+    hijacked = summary["hijacked_asns"]
+    all_hijacked = summary["all_hijacked"]
+
+    if all_hijacked:
+        gs.status = "red"
+        gs.alert_fired = True
+        message_id = await _send_alert(
+            bot=bot, code=code, mirror=mirror, status="red",
+            reason=(
+                f"All {len(asns)} confirm ASNs 100% hijacked — "
+                f"{trigger} + RIPE 4/4 ({', '.join(f'AS{a}' for a in asns)})"
+            ),
+            first_detected=now,
+        )
+        gs.last_alert_sent = now.isoformat(timespec="seconds")
+        if message_id is not None:
+            gs.last_alert_message_id = message_id
+        log.warning("[%s] 4-ASN CONFIRM: ALL hijacked — ALERT FIRED", code)
+    else:
+        log.info(
+            "[%s] 4-ASN confirm did NOT reach 4/4 — hijacked: %s — suppressing alert",
+            code, hijacked,
+        )
+        # Don't alert, but keep the failure streak so next Decodo failure re-triggers
+    state.save()
+
+
+# ---------------------------------------------------------------------------
 # Monitor cycle
 # ---------------------------------------------------------------------------
 def _load_redirects() -> dict:
@@ -713,129 +904,10 @@ def _load_redirects() -> dict:
     return {}
 
 
-# ---------------------------------------------------------------------------
-# Per-method cycle helpers
-# Each returns (effective_status, reason, should_alert) after updating gs
-# in place. Status "skip" means: don't write alert/history for this cycle.
-# ---------------------------------------------------------------------------
-def _ripe_slot_id(now: datetime) -> str | None:
-    """Return the current scheduled slot id if `now` falls inside one.
-    We say a slot is "open" for the first 10 minutes after the scheduled hour
-    so a single scheduled cycle catches it."""
-    if now.hour in RIPE_SCHEDULE_HOURS and now.minute < 10:
-        return f"{now.date().isoformat()}T{now.hour:02d}"
-    return None
-
-
-async def _cycle_hu_consensus(loop, gs: GeoState, code: str, mirror: str
-                              ) -> tuple[str, str | None, bool]:
-    status, reason = await loop.run_in_executor(None, check_hu_consensus, code, mirror)
-    if status == "up":
-        gs.consecutive_failures = 0
-        effective = "up"
-    elif status == "red":
-        gs.consecutive_failures += 1
-        # Only surface red once the consensus has persisted long enough.
-        if gs.consecutive_failures >= HU_CONSECUTIVE_FAILURES:
-            effective = "red"
-        else:
-            effective = gs.status if gs.status in ("red", "orange") else "unknown"
-    else:
-        gs.consecutive_failures += 1
-        effective = gs.status if gs.status in ("red", "orange") else "unknown"
-    alert = (effective == "red" and gs.status != "red")
-    return effective, reason, alert
-
-
-async def _cycle_ripe_reliable_asn(loop, gs: GeoState, code: str, mirror: str,
-                                    now: datetime) -> tuple[str, str | None, bool]:
-    slot = _ripe_slot_id(now)
-    due_scheduled = (slot is not None and gs.last_ripe_slot != slot)
-
-    due_pending = False
-    if gs.pending_confirmation and gs.pending_first_seen:
-        try:
-            last = datetime.fromisoformat(gs.last_checked) if gs.last_checked else None
-        except ValueError:
-            last = None
-        if last is None or (now - last).total_seconds() >= RIPE_PENDING_GAP_MINUTES * 60:
-            due_pending = True
-
-    if not (due_scheduled or due_pending):
-        return "skip", None, False
-
-    status, reason = await loop.run_in_executor(None, check_ripe_reliable_asn, code, mirror)
-    if due_scheduled:
-        gs.last_ripe_slot = slot
-
-    if status == "up":
-        cleared = gs.pending_confirmation
-        gs.pending_confirmation = False
-        gs.pending_first_seen = None
-        gs.pending_attempts = 0
-        gs.pending_bad_ip = None
-        return "up", ("pending cleared" if cleared else None), False
-
-    if status == "red":
-        if not gs.pending_confirmation:
-            gs.pending_confirmation = True
-            gs.pending_first_seen = now.isoformat(timespec="seconds")
-            gs.pending_attempts = 1
-            return "orange", f"pending 1/{RIPE_PENDING_ATTEMPTS}: {reason}", False
-        gs.pending_attempts += 1
-        if gs.pending_attempts >= RIPE_PENDING_ATTEMPTS:
-            alert = (gs.status != "red")
-            return "red", f"confirmed after {gs.pending_attempts} attempts — {reason}", alert
-        return "orange", f"pending {gs.pending_attempts}/{RIPE_PENDING_ATTEMPTS}: {reason}", False
-
-    # status == orange
-    return gs.status if gs.status in ("up", "red", "orange") else "orange", reason, False
-
-
-async def _cycle_decodo_plus_ripe(loop, gs: GeoState, code: str, mirror: str,
-                                   now: datetime) -> tuple[str, str | None, bool]:
-    # Primary fast path (Decodo country-level proxy).
-    status, reason = await loop.run_in_executor(None, check_http, code, mirror)
-
-    weekly_due = (
-        now.weekday() == WEEKLY_RIPE_DOW
-        and now.hour == WEEKLY_RIPE_HOUR
-        and now.minute < 10
-        and gs.last_weekly_ripe != now.date().isoformat()
-    )
-
-    if status == "up" and not weekly_due:
-        gs.consecutive_failures = 0
-        return "up", None, False
-
-    if status == "red":
-        gs.consecutive_failures += 1
-    elif status == "orange":
-        gs.consecutive_failures += 1
-
-    trigger_confirm = (status == "red" and gs.consecutive_failures >= PROXY_ERROR_THRESHOLD) or weekly_due
-    if not trigger_confirm:
-        effective = "orange" if gs.consecutive_failures >= PROXY_ERROR_THRESHOLD else (
-            gs.status if gs.status in ("up", "red", "orange") else "unknown"
-        )
-        return effective, reason, False
-
-    # 4-ASN confirm — only escalate if ALL ASNs are 100% hijacked.
-    if weekly_due:
-        gs.last_weekly_ripe = now.date().isoformat()
-    confirm_status, confirm_reason = await loop.run_in_executor(None, _run_4asn_confirm, code, mirror)
-    combined = f"decodo={status} ({reason}); confirm={confirm_status} ({confirm_reason})"
-    if confirm_status == "red":
-        alert = (gs.status != "red")
-        return "red", combined, alert
-    return "up" if status == "up" else "orange", combined, False
-
-
 async def run_monitor_cycle(bot: discord.Client) -> None:
     """
-    One pass over every enabled GEO. Each method decides whether it actually
-    runs this cycle (cadence gating lives in the per-method helper).
-    Runs sync check functions in a thread executor so the event loop isn't blocked.
+    One pass over every enabled GEO. Runs sync check functions in a thread
+    executor so the event loop isn't blocked.
     """
     state = MonitorState.load()
     redirects = _load_redirects()
@@ -845,6 +917,10 @@ async def run_monitor_cycle(bot: discord.Client) -> None:
     for code, geo in GEOS.items():
         if not geo["monitor"]:
             continue
+        # GR/PL use scheduled RIPE checks, not the regular cycle
+        if geo["check_method"] == "ripe_reliable_asn":
+            continue
+
         gs = state.get(code)
 
         # Respect ignore window
@@ -854,82 +930,353 @@ async def run_monitor_cycle(bot: discord.Client) -> None:
                 if ignored_until > now:
                     log.info("%s ignored until %s — skipping", code, gs.ignored_until)
                     continue
+                # Ignore window expired — clear it
                 gs.ignored_until = None
             except ValueError:
                 gs.ignored_until = None
 
+        # Get the mirror from redirects.json
         mirror = (redirects.get(code) or {}).get("mirror")
         if not mirror:
             log.warning("%s: no mirror in redirects.json — skipping", code)
             continue
 
-        method_name = geo["check_method"]
-        prev_status = gs.status
+        # Run the configured check method in a thread
+        check_method = geo["check_method"]
 
-        try:
-            if method_name == "hu_consensus":
-                effective, reason, should_alert = await _cycle_hu_consensus(loop, gs, code, mirror)
-            elif method_name == "ripe_reliable_asn":
-                effective, reason, should_alert = await _cycle_ripe_reliable_asn(loop, gs, code, mirror, now)
-            elif method_name == "decodo_plus_ripe_confirm":
-                effective, reason, should_alert = await _cycle_decodo_plus_ripe(loop, gs, code, mirror, now)
-            elif method_name in CHECK_METHODS:
-                # Legacy path (http / dns / anything else registered).
-                method = CHECK_METHODS[method_name]
-                status, reason = await loop.run_in_executor(None, method, code, mirror)
-                if status == "up":
-                    gs.consecutive_failures = 0
-                    effective = "up"
-                elif status == "red":
-                    gs.consecutive_failures += 1
-                    effective = "red"
-                else:
-                    gs.consecutive_failures += 1
-                    effective = "orange" if gs.consecutive_failures >= PROXY_ERROR_THRESHOLD else (
-                        gs.status if gs.status in ("up", "red", "orange") else "unknown"
-                    )
-                should_alert = (effective in ("red", "orange") and effective != prev_status)
-            else:
-                log.error("%s: unknown check_method '%s'", code, method_name)
-                continue
-        except Exception as e:
-            effective, reason, should_alert = "orange", f"Cycle raised {type(e).__name__}: {e}", False
-
-        if effective == "skip":
-            # Cadence gate said "not this cycle" — don't touch alert state.
+        # decodo_plus_ripe_confirm uses check_http for the primary Decodo check
+        method = CHECK_METHODS.get("http" if check_method == "decodo_plus_ripe_confirm" else check_method)
+        if not method:
+            log.error("%s: unknown check_method '%s'", code, check_method)
             continue
 
-        # Re-alert window: even if status didn't change, re-alert after N hours.
-        if not should_alert and effective in ("red", "orange") and gs.last_alert_sent:
-            try:
-                last = datetime.fromisoformat(gs.last_alert_sent)
-                if (now - last).total_seconds() >= REALERT_AFTER_HOURS * 3600:
-                    should_alert = True
-            except ValueError:
-                pass
+        try:
+            status, reason = await loop.run_in_executor(None, method, code, mirror)
+        except Exception as e:
+            status, reason = "orange", f"Check raised {type(e).__name__}: {e}"
 
-        gs.status = effective
+        prev_status = gs.status
         gs.active_mirror = mirror
         gs.last_checked = now.isoformat(timespec="seconds")
         gs.last_reason = reason
-        gs.record(mirror=mirror, status=effective, reason=reason, at=now)
+        gs.record(mirror=mirror, status=status, reason=reason, at=now)
 
-        if should_alert:
-            message_id = await _send_alert(
-                bot=bot, code=code, mirror=mirror,
-                status=effective, reason=reason or "(no detail)", first_detected=now,
+        # --- HU consensus path ---
+        if check_method == "hu_consensus":
+            if status == "up":
+                gs.clear_outage()
+            elif status == "blocked":
+                gs.consecutive_failures += 1
+                if gs.consecutive_failures >= FAILURE_THRESHOLD_HU:
+                    gs.status = "red"
+                    should_alert = _should_alert(gs, prev_status, now)
+                    if should_alert:
+                        message_id = await _send_alert(
+                            bot=bot, code=code, mirror=mirror, status="red",
+                            reason=f"All ASNs blocked for {gs.consecutive_failures} consecutive cycles — {reason}",
+                            first_detected=now,
+                        )
+                        gs.last_alert_sent = now.isoformat(timespec="seconds")
+                        if message_id is not None:
+                            gs.last_alert_message_id = message_id
+                else:
+                    gs.status = "pending"
+                log.info(
+                    "%s mirror=%s BLOCKED streak=%d/%d",
+                    code, mirror, gs.consecutive_failures, FAILURE_THRESHOLD_HU,
+                )
+            else:
+                # inconclusive — preserve streak, don't count as failure
+                log.info("%s mirror=%s inconclusive — streak preserved at %d", code, mirror, gs.consecutive_failures)
+
+        # --- DK/NO/FR/AE: Decodo + RIPE confirm path ---
+        elif check_method == "decodo_plus_ripe_confirm":
+            if status == "up":
+                gs.clear_outage()
+                log.info("%s mirror=%s UP via Decodo", code, mirror)
+            elif status == "orange":
+                # Proxy error — don't count as failure, preserve streak
+                log.info("%s mirror=%s Decodo orange (%s) — streak preserved at %d",
+                         code, mirror, reason, gs.consecutive_failures)
+            else:
+                # red — Decodo sees a block signal
+                gs.consecutive_failures += 1
+                log.warning("%s mirror=%s Decodo RED — streak %d/%d — %s",
+                            code, mirror, gs.consecutive_failures, DECODO_FAILURE_THRESHOLD, reason)
+                if gs.consecutive_failures >= DECODO_FAILURE_THRESHOLD and not gs.alert_fired:
+                    # Escalate to 4-ASN RIPE confirmation
+                    gs.status = "pending"
+                    await _run_4asn_confirm(
+                        bot, code, mirror, gs, state,
+                        trigger=f"Decodo {gs.consecutive_failures} consecutive failures",
+                    )
+
+        # --- Standard HTTP/DNS path (fallback) ---
+        else:
+            if status == "up":
+                gs.consecutive_failures = 0
+                gs.status = "up"
+            elif status == "red":
+                gs.consecutive_failures += 1
+                gs.status = "red"
+            else:  # orange
+                gs.consecutive_failures += 1
+                if gs.consecutive_failures >= PROXY_ERROR_THRESHOLD:
+                    gs.status = "orange"
+                else:
+                    gs.status = prev_status if prev_status in ("up", "red", "orange") else "unknown"
+
+            effective_status = gs.status
+            should_alert = _should_alert(gs, prev_status, now)
+
+            if should_alert:
+                message_id = await _send_alert(
+                    bot=bot, code=code, mirror=mirror, status=effective_status,
+                    reason=reason or "(no detail)", first_detected=now,
+                )
+                gs.last_alert_sent = now.isoformat(timespec="seconds")
+                if message_id is not None:
+                    gs.last_alert_message_id = message_id
+
+            log.info(
+                "%s mirror=%s check=%s effective=%s fails=%d alert=%s reason=%s",
+                code, mirror, status, effective_status, gs.consecutive_failures,
+                "yes" if should_alert else "no", reason,
             )
-            gs.last_alert_sent = now.isoformat(timespec="seconds")
-            if message_id is not None:
-                gs.last_alert_message_id = message_id
-
-        log.info(
-            "%s mirror=%s method=%s effective=%s fails=%d alert=%s reason=%s",
-            code, mirror, method_name, effective, gs.consecutive_failures,
-            "yes" if should_alert else "no", reason,
-        )
 
     state.save()
+
+
+# ---------------------------------------------------------------------------
+# GR/PL — RIPE reliable-ASN scheduled check
+# ---------------------------------------------------------------------------
+async def _run_ripe_gr_pl_once(
+    bot: discord.Client,
+    cc: str,
+    label: str,
+) -> None:
+    """
+    One RIPE per-ASN sample for GR or PL. Handles pending-confirmation
+    window and new-ASN rapid escalation.
+    """
+    geo = GEOS.get(cc)
+    if not geo or not geo["monitor"]:
+        return
+
+    state = MonitorState.load()
+    redirects = _load_redirects()
+    now = datetime.now(timezone.utc)
+    gs = state.get(cc)
+
+    # Respect ignore window
+    if gs.ignored_until:
+        try:
+            if datetime.fromisoformat(gs.ignored_until) > now:
+                log.info("%s ignored — skipping RIPE check", cc)
+                return
+            gs.ignored_until = None
+        except ValueError:
+            gs.ignored_until = None
+
+    mirror = (redirects.get(cc) or {}).get("mirror")
+    if not mirror:
+        log.warning("%s: no mirror in redirects.json — skipping RIPE check", cc)
+        return
+
+    if not RIPE_ATLAS_API_KEY:
+        log.warning("%s: RIPE_ATLAS_API_KEY not set — skipping", cc)
+        return
+
+    # Build ASN list: reliable ASN + peer ASNs from config
+    reliable = RELIABLE_ASN.get(cc)
+    peer_asns = [a for a in geo.get("asns", []) if a != reliable]
+    all_asns = ([reliable] if reliable else []) + peer_asns
+    if not all_asns:
+        log.warning("%s: no ASNs configured — skipping RIPE check", cc)
+        return
+
+    log.info("[%s] RIPE per-ASN check (%s) — ASNs %s", cc, label, all_asns)
+
+    loop = asyncio.get_running_loop()
+    summary = await loop.run_in_executor(
+        None, ripe_check_per_asn, mirror, cc, all_asns
+    )
+
+    hijacked_asns = summary["hijacked_asns"]
+    reliable_hijacked = reliable and reliable in hijacked_asns
+
+    gs.active_mirror = mirror
+    gs.last_checked = now.isoformat(timespec="seconds")
+    gs.record(mirror=mirror, status="hijacked" if hijacked_asns else "up",
+              reason=f"RIPE {label}: hijacked ASNs={hijacked_asns}", at=now)
+
+    # --- Clean result: no ASNs hijacked ---
+    if not hijacked_asns and not reliable_hijacked:
+        gs.clear_outage()
+        gs.last_reason = None
+        log.info("[%s] %s — UP (no ASNs hijacked)", cc, mirror)
+        state.save()
+        return
+
+    # --- Down candidate ---
+    prev_blocked = set(gs.last_blocked_asns or [])
+    now_blocked = set(hijacked_asns)
+    new_asns = sorted(now_blocked - prev_blocked)
+    gs.last_blocked_asns = sorted(now_blocked)
+    gs.last_reason = f"Hijacked ASNs: {', '.join(f'AS{a}' for a in hijacked_asns)}"
+
+    # Rapid escalation: new ASN hijacked mid-pending-window → alert immediately
+    if gs.pending_confirmation and new_asns and not gs.alert_fired:
+        log.warning("[%s] RAPID ESCALATION — new ASNs hijacked: %s", cc, new_asns)
+        gs.status = "red"
+        gs.alert_fired = True
+        message_id = await _send_alert(
+            bot=bot, code=cc, mirror=mirror, status="red",
+            reason=f"DNS hijack expanded — new ASNs: {', '.join(f'AS{a}' for a in new_asns)}",
+            first_detected=now,
+        )
+        gs.last_alert_sent = now.isoformat(timespec="seconds")
+        if message_id is not None:
+            gs.last_alert_message_id = message_id
+        state.save()
+        return
+
+    # Not yet in pending window → open one
+    if not gs.pending_confirmation:
+        gs.pending_confirmation = True
+        gs.pending_first_seen = now.isoformat(timespec="seconds")
+        gs.pending_attempts = 1
+        gs.status = "pending"
+        state.save()
+        log.warning(
+            "[%s] Entering pending-confirmation (attempt 1/%d) — "
+            "reliable AS%s %s, %d ASN(s) hijacked. Retry in %d min.",
+            cc, PENDING_MAX_ATTEMPTS,
+            reliable, "HIJACKED" if reliable_hijacked else "clean",
+            len(hijacked_asns), PENDING_RETRY_MINUTES,
+        )
+        return
+
+    # Already pending → this is a retry
+    gs.pending_attempts += 1
+    gs.status = "pending"
+    log.warning(
+        "[%s] Pending retry %d/%d — %d ASN(s) still hijacked",
+        cc, gs.pending_attempts, PENDING_MAX_ATTEMPTS, len(hijacked_asns),
+    )
+
+    if gs.pending_attempts >= PENDING_MAX_ATTEMPTS and not gs.alert_fired:
+        gs.status = "red"
+        gs.alert_fired = True
+        message_id = await _send_alert(
+            bot=bot, code=cc, mirror=mirror, status="red",
+            reason=(
+                f"DNS hijack confirmed after {PENDING_MAX_ATTEMPTS} checks — "
+                f"reliable AS{reliable}={'HIJACKED' if reliable_hijacked else 'clean'}, "
+                f"{len(hijacked_asns)} ASN(s) hijacked"
+            ),
+            first_detected=datetime.fromisoformat(gs.pending_first_seen) if gs.pending_first_seen else now,
+        )
+        gs.last_alert_sent = now.isoformat(timespec="seconds")
+        if message_id is not None:
+            gs.last_alert_message_id = message_id
+
+    state.save()
+
+
+async def run_ripe_scheduled(bot: discord.Client) -> None:
+    """Run the scheduled RIPE check for all GR/PL GEOs with monitor: true."""
+    for cc in ("GR", "PL"):
+        geo = GEOS.get(cc)
+        if not geo or not geo["monitor"]:
+            continue
+        try:
+            await _run_ripe_gr_pl_once(bot, cc, label="scheduled")
+        except Exception as e:
+            log.error("[%s] Scheduled RIPE check failed: %s", cc, e, exc_info=True)
+
+
+async def tick_pending_retries(bot: discord.Client) -> None:
+    """
+    Check if any GR/PL geo has a pending-confirmation window with a retry
+    due (>= PENDING_RETRY_MINUTES since last check). If so, run another
+    RIPE check for that geo.
+    """
+    now = datetime.now(timezone.utc)
+    state = MonitorState.load()
+
+    for cc in ("GR", "PL"):
+        geo = GEOS.get(cc)
+        if not geo or not geo["monitor"]:
+            continue
+        gs = state.get(cc)
+        if not gs.pending_confirmation or gs.alert_fired:
+            continue
+        if gs.pending_attempts >= PENDING_MAX_ATTEMPTS:
+            continue
+        if not gs.last_checked:
+            continue
+        try:
+            last = datetime.fromisoformat(gs.last_checked)
+        except ValueError:
+            continue
+        if (now - last) < timedelta(minutes=PENDING_RETRY_MINUTES):
+            continue
+
+        log.info("[%s] Pending retry due — running RIPE check", cc)
+        try:
+            await _run_ripe_gr_pl_once(bot, cc, label="pending retry")
+        except Exception as e:
+            log.error("[%s] Pending retry failed: %s", cc, e, exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# DK/NO/FR/AE — weekly RIPE proactive sweep (Monday 04:00 UTC)
+# ---------------------------------------------------------------------------
+async def run_weekly_ripe_sweep(bot: discord.Client) -> None:
+    """
+    Proactive country-level RIPE check for DK/NO/FR/AE.
+    If any country shows DNS hijack, trigger 4-ASN confirmation.
+    """
+    state = MonitorState.load()
+    redirects = _load_redirects()
+
+    for cc in ("DK", "NO", "FR", "AE"):
+        geo = GEOS.get(cc)
+        if not geo or not geo["monitor"]:
+            continue
+        mirror = (redirects.get(cc) or {}).get("mirror")
+        if not mirror:
+            log.warning("[%s] No mirror in redirects.json — skipping weekly sweep", cc)
+            continue
+
+        gs = state.get(cc)
+        if gs.alert_fired:
+            log.info("[%s] Alert already fired — skipping weekly sweep", cc)
+            continue
+
+        # Run a country-level RIPE check using the confirm ASNs
+        asns = CONFIRM_ASNS.get(cc, [])
+        if not asns:
+            continue
+
+        log.info("[%s] Weekly RIPE sweep — checking ASNs %s", cc, asns)
+        try:
+            loop = asyncio.get_running_loop()
+            summary = await loop.run_in_executor(
+                None, ripe_check_per_asn, mirror, cc, asns
+            )
+            if summary["hijacked_asns"]:
+                log.warning("[%s] Weekly sweep found hijacked ASNs: %s — running 4-ASN confirm",
+                            cc, summary["hijacked_asns"])
+                await _run_4asn_confirm(
+                    bot, cc, mirror, gs, state,
+                    trigger="Weekly RIPE sweep detected hijack",
+                )
+            else:
+                log.info("[%s] Weekly sweep clean", cc)
+        except Exception as e:
+            log.error("[%s] Weekly sweep failed: %s", cc, e, exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -967,15 +1314,54 @@ async def run_adhoc_check(
 def create_monitor_task(bot: discord.Client) -> tasks.Loop:
     """
     Create a discord.ext.tasks loop that runs the monitor cycle on the
-    configured interval. Caller is responsible for .start()ing it after
-    the bot is ready.
+    configured interval. Also handles:
+      - GR/PL scheduled RIPE checks at 04:00 and 16:00 UTC
+      - GR/PL pending-confirmation retry ticks
+    Caller is responsible for .start()ing it after the bot is ready.
     """
+    # Track the last hour we ran RIPE scheduled checks to avoid double-firing
+    _last_ripe_hour: dict[str, int | None] = {"value": None}
+    _last_weekly_sweep_date: dict[str, str | None] = {"value": None}
+
     @tasks.loop(minutes=INTERVAL_MINUTES)
     async def monitor_loop():
+        now = datetime.now(timezone.utc)
+
+        # --- Regular HTTP cycle (HU + DK/NO/FR/AE Decodo) ---
         try:
             await run_monitor_cycle(bot)
         except Exception as e:
             print(f"[monitor] Unexpected error in cycle: {type(e).__name__}: {e}", flush=True)
+
+        # --- GR/PL scheduled RIPE checks at 04:00 and 16:00 UTC ---
+        current_hour = now.hour
+        if current_hour in RIPE_SCHEDULE_HOURS and _last_ripe_hour["value"] != current_hour:
+            _last_ripe_hour["value"] = current_hour
+            try:
+                await run_ripe_scheduled(bot)
+            except Exception as e:
+                print(f"[monitor] RIPE scheduled check error: {type(e).__name__}: {e}", flush=True)
+
+        # Reset tracker when we leave a scheduled hour
+        if current_hour not in RIPE_SCHEDULE_HOURS:
+            _last_ripe_hour["value"] = None
+
+        # --- DK/NO/FR/AE weekly RIPE sweep — Monday 04:00 UTC ---
+        today_str = now.strftime("%Y-%m-%d")
+        if (now.weekday() == 0  # Monday
+                and current_hour == 4
+                and _last_weekly_sweep_date["value"] != today_str):
+            _last_weekly_sweep_date["value"] = today_str
+            try:
+                await run_weekly_ripe_sweep(bot)
+            except Exception as e:
+                print(f"[monitor] Weekly RIPE sweep error: {type(e).__name__}: {e}", flush=True)
+
+        # --- GR/PL pending-confirmation retry ticks ---
+        try:
+            await tick_pending_retries(bot)
+        except Exception as e:
+            print(f"[monitor] Pending retry tick error: {type(e).__name__}: {e}", flush=True)
 
     @monitor_loop.before_loop
     async def wait_until_ready():
