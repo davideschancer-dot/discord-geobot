@@ -316,6 +316,154 @@ async def redirect_status(interaction: discord.Interaction):
 
 
 # ---------------------------------------------------------------------------
+# /mirror-test — simulation/demo command for stakeholders
+# ---------------------------------------------------------------------------
+def _clean_domain(url: str) -> str:
+    """Strip protocol, path, and trailing slashes from a user-supplied URL."""
+    url = url.strip().lower()
+    for prefix in ("https://", "http://", "www."):
+        if url.startswith(prefix):
+            url = url[len(prefix):]
+    return url.rstrip("/")
+
+
+def _get_ripe_asns(geo_code: str) -> list[str]:
+    """Get the ASN list to use for RIPE checks for a given GEO."""
+    if geo_code in monitor.CONFIRM_ASNS:
+        return monitor.CONFIRM_ASNS[geo_code]
+    geo = monitor.GEOS.get(geo_code, {})
+    return geo.get("asns", [])
+
+
+@tree.command(name="mirror-test", description="Test if a domain is blocked in a country (simulation — does not affect monitoring)")
+@app_commands.describe(
+    url="Domain to test (e.g. wolfycasino.com)",
+    geo="Country to test from",
+)
+@app_commands.choices(geo=GEO_CHOICES)
+async def mirror_test(interaction: discord.Interaction, url: str, geo: str):
+    geo = geo.upper()
+    geo_info = GEO_MAP.get(geo)
+    if not geo_info:
+        await interaction.response.send_message(
+            f"Unknown GEO: `{geo}`.", ephemeral=True,
+        )
+        return
+
+    domain = _clean_domain(url)
+    await interaction.response.defer()
+
+    loop = asyncio.get_running_loop()
+
+    # Run Decodo HTTP and RIPE DNS checks concurrently
+    if geo == "HU":
+        http_fut = loop.run_in_executor(None, monitor.check_hu_consensus, geo, domain)
+    else:
+        http_fut = loop.run_in_executor(None, monitor.check_http, geo, domain)
+
+    asns = _get_ripe_asns(geo)
+    ripe_fut = None
+    if asns and monitor.RIPE_ATLAS_API_KEY:
+        ripe_fut = loop.run_in_executor(None, monitor.ripe_check_per_asn, domain, geo, asns)
+
+    http_status, http_reason = await http_fut
+
+    # For HU consensus, map "blocked" → "red" and "inconclusive" → "orange"
+    if http_status == "blocked":
+        http_status = "red"
+    elif http_status == "inconclusive":
+        http_status = "orange"
+
+    ripe_summary = None
+    ripe_failed = False
+    if ripe_fut is not None:
+        try:
+            ripe_summary = await ripe_fut
+        except Exception as e:
+            ripe_failed = True
+            print(f"[mirror-test] RIPE check failed: {e}", flush=True)
+
+    # --- Traffic light verdict ---
+    hijacked_count = 0
+    total_asns = len(asns)
+
+    if ripe_summary and not ripe_failed:
+        hijacked_count = len(ripe_summary.get("hijacked_asns", []))
+
+        if http_status == "up" and hijacked_count == 0:
+            verdict = "green"
+        elif http_status == "red" and total_asns > 0 and hijacked_count >= total_asns / 2:
+            verdict = "red"
+        elif http_status == "red" or http_status == "orange":
+            verdict = "orange"
+        else:
+            verdict = "green"
+    else:
+        # RIPE unavailable — Decodo only
+        if http_status == "up":
+            verdict = "green"
+        elif http_status == "orange":
+            verdict = "orange"
+        else:
+            verdict = "red"
+
+    # --- Build embed ---
+    colors = {"green": 0x2ECC71, "orange": 0xF39C12, "red": 0xE74C3C}
+    titles = {
+        "green": "Available",
+        "orange": "Potentially Blocked",
+        "red": "Blocked",
+    }
+    emojis = {"green": "\U0001f7e2", "orange": "\U0001f7e0", "red": "\U0001f534"}
+
+    verdict_label = titles[verdict]
+    summary_map = {
+        "green": f"`{domain}` appears fully accessible in {geo_info['name']}.",
+        "orange": f"`{domain}` shows signs of issues in {geo_info['name']}, but not enough evidence to confirm a block.",
+        "red": f"`{domain}` is blocked in {geo_info['name']} with high confidence.",
+    }
+
+    embed = discord.Embed(
+        title=f"{emojis[verdict]} {verdict_label}",
+        description=summary_map[verdict],
+        color=colors[verdict],
+    )
+    embed.add_field(name="Domain", value=f"`{domain}`", inline=True)
+    embed.add_field(name="Country", value=f"{geo_info['flag']} {geo_info['name']}", inline=True)
+    embed.add_field(
+        name="HTTP Check",
+        value=f"**{http_status.upper()}**{(' — ' + http_reason) if http_reason else ''}",
+        inline=False,
+    )
+
+    # DNS check field
+    if ripe_failed or (ripe_fut is None):
+        dns_text = "DNS confirmation unavailable"
+        if not monitor.RIPE_ATLAS_API_KEY:
+            dns_text += " (RIPE API key not set)"
+        elif not asns:
+            dns_text += " (no ASNs configured for this GEO)"
+        elif ripe_failed:
+            dns_text += " (API error)"
+    elif ripe_summary:
+        hijacked_asns = ripe_summary.get("hijacked_asns", [])
+        per_asn = ripe_summary.get("per_asn", {})
+        lines = [f"**{hijacked_count}/{total_asns}** ASNs hijacked"]
+        for asn, data in per_asn.items():
+            ips_str = ", ".join(data.get("ips", [])) or "no response"
+            status_icon = "\U0001f534" if data.get("hijacked") else "\u2705"
+            lines.append(f"{status_icon} AS{asn}: {ips_str}")
+        dns_text = "\n".join(lines)
+    else:
+        dns_text = "No RIPE data"
+
+    embed.add_field(name="DNS Check", value=dns_text, inline=False)
+    embed.set_footer(text="Simulation only \u2014 does not affect live monitoring")
+
+    await interaction.followup.send(embed=embed)
+
+
+# ---------------------------------------------------------------------------
 # Bot lifecycle
 # ---------------------------------------------------------------------------
 @bot.event
