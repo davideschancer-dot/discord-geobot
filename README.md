@@ -34,12 +34,14 @@ process.
 |---|---|
 | `/check-redirect geo:HU` | Pauses the monitor, runs the VPN-based redirect check, saves result to `redirects.json`, resumes monitor after 60s |
 | `/redirect-status` | Shows the current saved redirects for all GEOs |
+| `/mirror-test url:domain.com geo:HU` | On-demand block test for any domain. Runs Decodo HTTP + RIPE DNS checks and returns a traffic light verdict. Simulation only — does not affect live monitoring |
 
 ## Monitor check methods
 
 The background monitor uses three different strategies depending on the country:
 
 ### Hungary (`hu_consensus`)
+- **Decodo only** — Hungary uses HTTP-level blocking (SZTFH block pages), not DNS hijacking, so RIPE Atlas is not used
 - Decodo residential proxy with **per-ASN routing** every 10 minutes
 - Checks 4 Hungarian ISP ASNs in parallel: Magyar Telekom, Vodafone, DIGI, Yettel
 - **ALL 4** must report blocked in the same cycle for it to count as a failure
@@ -55,9 +57,25 @@ The background monitor uses three different strategies depending on the country:
 
 ### DK, NO, FR, AE (`decodo_plus_ripe_confirm`)
 - Primary: Decodo HTTP check every 10 minutes (single proxy, no per-ASN)
-- After **2 consecutive** Decodo failures, escalates to 4-ASN RIPE confirmation
+- After **3 consecutive** Decodo failures, escalates to 4-ASN RIPE confirmation
 - ALL 4 configured confirm ASNs must show 100% DNS hijack before alert fires
 - Weekly proactive RIPE sweep on **Monday 04:00 UTC**
+
+## /mirror-test — on-demand block testing
+
+`/mirror-test url:wolfycasino.com geo:FR` runs an independent check against any domain
+in any configured country. It does not affect live monitoring, redirects, or state.
+
+Both Decodo HTTP and RIPE DNS checks run concurrently. The result is a traffic light embed:
+
+| Verdict | Condition |
+|---|---|
+| **GREEN** | Decodo HTTP up AND RIPE shows 0 ASNs hijacked |
+| **ORANGE** | Any hijacked ASNs but < 50%, OR Decodo red/orange with clean DNS |
+| **RED** | RIPE >= 50% ASNs hijacked (regardless of Decodo) |
+
+For **Hungary**, only Decodo runs (no RIPE) because HU uses HTTP-level blocking, not DNS hijacking.
+If RIPE is unavailable (no API key, no credits), falls back to Decodo-only verdict.
 
 ## Alert system
 
