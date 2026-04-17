@@ -361,7 +361,8 @@ async def mirror_test(interaction: discord.Interaction, url: str, geo: str):
     else:
         http_fut = loop.run_in_executor(None, monitor.check_http, geo, domain)
 
-    asns = _get_ripe_asns(geo)
+    # HU uses HTTP-level blocking (SZTFH), not DNS hijacking — RIPE is irrelevant
+    asns = [] if geo == "HU" else _get_ripe_asns(geo)
     ripe_fut = None
     if asns and monitor.RIPE_ATLAS_API_KEY:
         ripe_fut = loop.run_in_executor(None, monitor.ripe_check_per_asn, domain, geo, asns)
