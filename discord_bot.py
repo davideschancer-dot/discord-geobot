@@ -431,9 +431,29 @@ async def mirror_test(interaction: discord.Interaction, url: str, geo: str):
     )
     embed.add_field(name="Domain", value=f"`{domain}`", inline=True)
     embed.add_field(name="Country", value=f"{geo_info['flag']} {geo_info['name']}", inline=True)
+    # Format HTTP check result — summarize verbose multi-ASN reasons
+    if http_reason and len(http_reason) > 200:
+        # For HU consensus, extract the key signal from the verbose output
+        if "All" in http_reason and "ASNs blocked" in http_reason:
+            # e.g. "All 4 ASNs blocked — AS20845: SSL error...; AS5483: SSL error..."
+            first_reason = http_reason.split(": ", 2)[-1].split(";")[0].strip()
+            # Identify the type of block
+            if "SZTFH" in http_reason:
+                http_display = "All 4 ASNs blocked — SZTFH government block page"
+            elif "SSL error" in http_reason:
+                http_display = "All 4 ASNs blocked — SSL connection reset (ISP interception)"
+            elif "Redirected to unknown domain" in http_reason:
+                http_display = "All 4 ASNs blocked — redirected to unknown domain"
+            else:
+                http_display = http_reason[:180] + "..."
+        else:
+            http_display = http_reason[:180] + "..."
+    else:
+        http_display = http_reason
+
     embed.add_field(
         name="HTTP Check",
-        value=f"**{http_status.upper()}**{(' — ' + http_reason) if http_reason else ''}",
+        value=f"**{http_status.upper()}**{(' — ' + http_display) if http_display else ''}",
         inline=False,
     )
 
