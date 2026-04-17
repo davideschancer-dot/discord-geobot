@@ -32,7 +32,7 @@ process.
 
 | Command | What it does |
 |---|---|
-| `/check-redirect geo:HU` | Pauses the monitor, runs the VPN-based redirect check, saves result to `redirects.json`, resumes monitor after 60s |
+| `/check-redirect geo:HU` | Pauses the monitor, runs the VPN-based redirect check, saves result to `redirects.json`, updates the channel topic with current mirrors, resumes monitor after 60s |
 | `/redirect-status` | Shows the current saved redirects for all GEOs |
 | `/mirror-test url:domain.com geo:HU` | On-demand block test for any domain. Runs Decodo HTTP + RIPE DNS checks and returns a traffic light verdict. Simulation only — does not affect live monitoring |
 
