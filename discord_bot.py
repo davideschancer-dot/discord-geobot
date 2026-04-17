@@ -157,12 +157,12 @@ async def _restart_monitor_after_delay(delay: int = MONITOR_PAUSE_SECONDS):
 
 async def _update_channel_topic(channel, redirects: dict) -> None:
     """Update the channel topic with the current mirror state for all GEOs."""
-    parts = []
+    lines = ["CURRENT REDIRECTS", ""]
     for code, entry in sorted(redirects.items()):
         geo_info = GEO_MAP.get(code, {"flag": "", "name": code})
         mirror = entry.get("mirror", "?")
-        parts.append(f"{geo_info['flag']} {mirror}")
-    new_topic = " | ".join(parts)
+        lines.append(f"{geo_info['flag']} {geo_info['name']}: {mirror}")
+    new_topic = "\n".join(lines)
 
     current_topic = channel.topic or ""
     if current_topic == new_topic:
