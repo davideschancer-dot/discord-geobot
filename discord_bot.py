@@ -390,10 +390,10 @@ async def mirror_test(interaction: discord.Interaction, url: str, geo: str):
     if ripe_summary and not ripe_failed:
         hijacked_count = len(ripe_summary.get("hijacked_asns", []))
 
-        if http_status == "up" and hijacked_count == 0:
-            verdict = "green"
-        elif http_status == "red" and total_asns > 0 and hijacked_count >= total_asns / 2:
+        if total_asns > 0 and hijacked_count >= total_asns / 2:
             verdict = "red"
+        elif hijacked_count > 0:
+            verdict = "orange"
         elif http_status == "red" or http_status == "orange":
             verdict = "orange"
         else:
