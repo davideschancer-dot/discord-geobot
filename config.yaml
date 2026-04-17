@@ -21,7 +21,7 @@ monitor:
   # HU-specific: consecutive all-ASN-blocked cycles before alert fires.
   failure_threshold_hu: 6
   # DK/NO/FR/AE: consecutive Decodo failures before 4-ASN RIPE confirmation.
-  decodo_failure_threshold: 2
+  decodo_failure_threshold: 3
 
 # ---------------------------------------------------------------------------
 # GEOs
