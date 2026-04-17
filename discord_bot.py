@@ -155,6 +155,28 @@ async def _restart_monitor_after_delay(delay: int = MONITOR_PAUSE_SECONDS):
         print("[pause-on-check] Monitor restarted", flush=True)
 
 
+async def _update_channel_topic(channel, redirects: dict) -> None:
+    """Update the channel topic with the current mirror state for all GEOs."""
+    parts = []
+    for code, entry in sorted(redirects.items()):
+        geo_info = GEO_MAP.get(code, {"flag": "", "name": code})
+        mirror = entry.get("mirror", "?")
+        parts.append(f"{geo_info['flag']} {mirror}")
+    new_topic = " | ".join(parts)
+
+    current_topic = channel.topic or ""
+    if current_topic == new_topic:
+        return
+
+    try:
+        await channel.edit(topic=new_topic)
+        print(f"[topic] Updated channel topic", flush=True)
+    except discord.Forbidden:
+        print("[topic] Bot lacks Manage Channels permission — cannot update topic", flush=True)
+    except discord.HTTPException as e:
+        print(f"[topic] Failed to update topic: {e}", flush=True)
+
+
 async def run_check_and_reply(
     interaction: discord.Interaction, geo: str, geo_info: dict
 ):
@@ -173,7 +195,6 @@ async def run_check_and_reply(
             await interaction.channel.send(
                 f"{geo_info['flag']} **{geo_info['name']}** — Failed to resolve mirror.\n`{err}`"
             )
-            # Still restart monitor even on failure
             asyncio.create_task(_restart_monitor_after_delay())
             return
 
@@ -190,7 +211,10 @@ async def run_check_and_reply(
             f"{geo_info['flag']} **{geo_info['name']}** → `{mirror}` (ec2_vpn, {now[:16].replace('T', ' ')})"
         )
 
-        # 4. Wait 60s then restart the monitor
+        # 4. Update channel topic with current mirror state
+        await _update_channel_topic(interaction.channel, redirects)
+
+        # 5. Wait 60s then restart the monitor
         asyncio.create_task(_restart_monitor_after_delay())
 
     except Exception as e:
