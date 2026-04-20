@@ -9,6 +9,7 @@ starts the EC2 discord-bot service.
 Run: python livemode.py
 """
 import json
+import os
 import subprocess
 import sys
 from urllib.request import urlopen
@@ -42,9 +43,15 @@ def main():
     # 1. Kill any local bot processes so we don't end up with two bots
     #    connected to the same Discord token.
     print("[1/4] Stopping any local bot processes...")
-    # On Windows, taskkill kills all python.exe; on Unix we use pkill.
+    # On Windows, taskkill kills all python.exe — but the /FI excludes our
+    # own PID so the script doesn't terminate itself before step 2 runs.
+    # On Unix we use pkill targeted at discord_bot.py.
     if sys.platform == "win32":
-        subprocess.run("taskkill /F /IM python.exe", shell=True, capture_output=True)
+        own_pid = os.getpid()
+        subprocess.run(
+            f'taskkill /F /IM python.exe /FI "PID ne {own_pid}"',
+            shell=True, capture_output=True,
+        )
     else:
         subprocess.run("pkill -f discord_bot.py", shell=True, capture_output=True)
     print("  Local bots stopped.")
