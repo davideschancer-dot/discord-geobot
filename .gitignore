@@ -6,3 +6,5 @@ redirects.json
 monitor_state.json
 logs/
 .DS_Store
+.claude/
+test_results.json
