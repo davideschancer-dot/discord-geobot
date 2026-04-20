@@ -104,6 +104,11 @@ ALERT_WEBHOOK_URL = os.getenv("DISCORD_ALERT_WEBHOOK_URL")
 # webhooks. Falls back to the webhook (without buttons) if unset.
 ALERT_CHANNEL_ID = os.getenv("DISCORD_ALERT_CHANNEL_ID")
 
+# EC2 redirect-checker endpoint (NordVPN tunnel per GEO). Used by both
+# /check-redirect and the Mirror updated alert button so they share one path.
+REDIRECT_CHECKER_URL = os.getenv("REDIRECT_CHECKER_URL", "http://127.0.0.1:8080")
+REDIRECT_CHECKER_KEY = os.getenv("REDIRECT_CHECKER_KEY", "chancer-geo-2026")
+
 # Expected Cloudflare IP for mirrors — anything else = DNS hijack
 EXPECTED_IP = "104.24.14.93"
 
@@ -748,6 +753,49 @@ CHECK_METHODS: dict[str, Callable[[str, str], tuple[str, str | None]]] = {
 
 
 # ---------------------------------------------------------------------------
+# EC2 redirect-checker call — shared between /check-redirect and the
+# AlertView "Mirror updated" button so they take the same path.
+# ---------------------------------------------------------------------------
+def resolve_mirror_sync(country_code: str) -> tuple[str | None, str | None]:
+    """Call the EC2 redirect checker. Returns (mirror_host, error_message)."""
+    try:
+        resp = requests.get(
+            f"{REDIRECT_CHECKER_URL}/check",
+            params={"key": REDIRECT_CHECKER_KEY, "geo": country_code.lower()},
+            timeout=60,
+        )
+        data = resp.json()
+        if resp.status_code == 200 and "mirror" in data:
+            return data["mirror"], None
+        return None, data.get("error", f"HTTP {resp.status_code}")
+    except requests.exceptions.Timeout:
+        return None, "Timeout calling redirect checker"
+    except requests.exceptions.ConnectionError:
+        return None, "Cannot reach redirect checker (EC2 down?)"
+    except Exception as e:
+        return None, f"Error: {e}"
+
+
+# ---------------------------------------------------------------------------
+# Monitor lifecycle hooks — discord_bot.py registers callables here at
+# startup so the AlertView (defined below) can pause/resume the monitor
+# loop without importing discord_bot (which would be circular).
+# ---------------------------------------------------------------------------
+_pause_monitor_callback: Callable[[], "asyncio.Future | None"] | None = None
+_resume_monitor_callback: Callable[[int], "asyncio.Future | None"] | None = None
+
+
+def register_monitor_lifecycle(
+    pause: Callable[[], "asyncio.Future | None"],
+    resume: Callable[[int], "asyncio.Future | None"],
+) -> None:
+    """Called once from discord_bot.on_ready to wire pause/resume."""
+    global _pause_monitor_callback, _resume_monitor_callback
+    _pause_monitor_callback = pause
+    _resume_monitor_callback = resume
+
+
+# ---------------------------------------------------------------------------
 # Alert view (persistent — survives bot restarts)
 # ---------------------------------------------------------------------------
 class AlertView(discord.ui.View):
@@ -792,6 +840,11 @@ class AlertView(discord.ui.View):
         custom_id="monitor_alert:mirror_updated",
     )
     async def mirror_updated(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """
+        End-to-end mirror rotation: invokes the same EC2 NordVPN check that
+        /check-redirect uses, writes the new mirror to redirects.json, and
+        resets monitor state. One click, one operator action.
+        """
         state = MonitorState.load()
         code = state.find_by_message_id(interaction.message.id)
         if not code:
@@ -801,18 +854,65 @@ class AlertView(discord.ui.View):
             )
             return
 
-        # Re-read redirects.json for the (presumably updated) mirror
-        redirects = {}
-        if REDIRECTS_FILE.exists():
-            redirects = json.loads(REDIRECTS_FILE.read_text(encoding="utf-8"))
-        new_mirror = (redirects.get(code) or {}).get("mirror")
-        if not new_mirror:
+        # SIM = test alert. Don't actually rotate a real geo's mirror —
+        # the operator may have run /mirror-test against any URL/geo combo.
+        if code == SIM_CODE:
             await interaction.response.send_message(
-                f"No mirror set for `{code}` in redirects.json. "
-                f"Run `/check-redirect geo:{code}` or `/set-redirect` first.",
+                "🧪 This is a `[TEST]` alert (synthetic detection from `/mirror-test`). "
+                "In a live alert this button would invoke `/check-redirect` for the affected "
+                "country and reset monitoring. No live action taken.",
                 ephemeral=True,
             )
             return
+
+        geo_info = GEOS.get(code, {"name": code, "flag": ""})
+        await interaction.response.defer(thinking=True)
+
+        # Pause the live monitor so its next cycle doesn't race the
+        # redirects.json write or overwrite our state reset.
+        if _pause_monitor_callback is not None:
+            try:
+                maybe_coro = _pause_monitor_callback()
+                if asyncio.iscoroutine(maybe_coro):
+                    await maybe_coro
+            except Exception as e:
+                log.warning("[%s] pause-monitor callback failed: %s", code, e)
+
+        loop = asyncio.get_running_loop()
+        try:
+            new_mirror, err = await loop.run_in_executor(
+                None, resolve_mirror_sync, code,
+            )
+        except Exception as e:
+            new_mirror, err = None, f"{type(e).__name__}: {e}"
+
+        if err or not new_mirror:
+            await interaction.followup.send(
+                f"❌ Failed to resolve new mirror for {geo_info['flag']} **{geo_info['name']}** — "
+                f"`{err or 'no mirror returned'}`. State unchanged. "
+                f"Try `/check-redirect geo:{code}` manually.",
+            )
+            # Still resume the monitor so we don't leave it paused on failure.
+            if _resume_monitor_callback is not None:
+                try:
+                    _resume_monitor_callback(MONITOR_PAUSE_SECONDS_AFTER_BUTTON)
+                except Exception:
+                    pass
+            return
+
+        # Persist the new mirror to redirects.json, then reset state.
+        redirects = {}
+        if REDIRECTS_FILE.exists():
+            redirects = json.loads(REDIRECTS_FILE.read_text(encoding="utf-8"))
+        redirects[code] = {
+            "mirror": new_mirror,
+            "updated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
+            "method": "ec2_vpn",
+        }
+        REDIRECTS_FILE.write_text(
+            json.dumps(redirects, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
 
         gs = state.get(code)
         gs.clear_outage()
@@ -821,11 +921,21 @@ class AlertView(discord.ui.View):
         gs.ignored_until = None
         state.save()
 
-        geo_info = GEOS.get(code, {"name": code, "flag": ""})
-        await interaction.response.send_message(
-            f"🔄 Now monitoring {geo_info['flag']} **{geo_info['name']}** against `{new_mirror}`. "
-            f"Next check in the upcoming cycle."
+        await interaction.followup.send(
+            f"🔄 {geo_info['flag']} **{geo_info['name']}** rotated to `{new_mirror}`. "
+            f"Monitor reset; next check in the upcoming cycle."
         )
+
+        # Resume monitor after a short delay so the new mirror has time to settle.
+        if _resume_monitor_callback is not None:
+            try:
+                _resume_monitor_callback(MONITOR_PAUSE_SECONDS_AFTER_BUTTON)
+            except Exception as e:
+                log.warning("[%s] resume-monitor callback failed: %s", code, e)
+
+
+# Same delay /check-redirect uses after a manual rotation.
+MONITOR_PAUSE_SECONDS_AFTER_BUTTON = 60
 
 
 # ---------------------------------------------------------------------------

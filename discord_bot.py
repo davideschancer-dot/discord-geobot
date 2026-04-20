@@ -38,12 +38,9 @@ DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 # sync (which Discord caches up to ~1h).
 DEV_GUILD_ID = os.getenv("DEV_GUILD_ID")
 
-# EC2 redirect checker endpoint (NordVPN Hungary tunnel)
-REDIRECT_CHECKER_URL = os.getenv(
-    "REDIRECT_CHECKER_URL",
-    "http://63.178.175.200:8080",
-)
-REDIRECT_CHECKER_KEY = os.getenv("REDIRECT_CHECKER_KEY", "chancer-geo-2026")
+# EC2 redirect-checker env vars are read inside monitor.py and reused via
+# monitor.resolve_mirror_sync — keeps /check-redirect and the AlertView
+# Mirror-updated button on a single shared path.
 
 PROJECT_DIR = Path(__file__).resolve().parent
 REDIRECTS_FILE = PROJECT_DIR / "redirects.json"
@@ -78,33 +75,10 @@ def save_redirects(data: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# EC2 redirect checker
+# EC2 redirect checker — implementation lives in monitor.resolve_mirror_sync
+# so the AlertView "Mirror updated" button can reuse the same path.
 # ---------------------------------------------------------------------------
-def resolve_mirror_sync(country_code: str) -> tuple[str | None, str | None]:
-    """
-    Call the EC2 redirect checker endpoint.
-    The EC2 instance routes chancer.bet through NordVPN Hungary.
-    Returns (mirror_host, error_message).
-    """
-    try:
-        resp = requests.get(
-            f"{REDIRECT_CHECKER_URL}/check",
-            params={"key": REDIRECT_CHECKER_KEY, "geo": country_code.lower()},
-            timeout=60,
-        )
-        data = resp.json()
-
-        if resp.status_code == 200 and "mirror" in data:
-            return data["mirror"], None
-
-        return None, data.get("error", f"HTTP {resp.status_code}")
-
-    except requests.exceptions.Timeout:
-        return None, "Timeout calling redirect checker"
-    except requests.exceptions.ConnectionError:
-        return None, "Cannot reach redirect checker (EC2 down?)"
-    except Exception as e:
-        return None, f"Error: {e}"
+resolve_mirror_sync = monitor.resolve_mirror_sync
 
 
 # ---------------------------------------------------------------------------
@@ -207,7 +181,7 @@ async def run_check_and_reply(
             await interaction.channel.send(
                 f"{geo_info['flag']} **{geo_info['name']}** — Failed to resolve mirror.\n`{err}`"
             )
-            asyncio.create_task(_restart_monitor_after_delay())
+            _spawn_bg_task(_restart_monitor_after_delay())
             return
 
         # 3. Write result to redirects.json
@@ -227,11 +201,11 @@ async def run_check_and_reply(
         await _update_channel_topic(interaction.channel, redirects)
 
         # 5. Wait 60s then restart the monitor
-        asyncio.create_task(_restart_monitor_after_delay())
+        _spawn_bg_task(_restart_monitor_after_delay())
 
     except Exception as e:
         await interaction.channel.send(f"Error: `{e}`")
-        asyncio.create_task(_restart_monitor_after_delay())
+        _spawn_bg_task(_restart_monitor_after_delay())
 
 
 class PurgeConfirmView(discord.ui.View):
@@ -558,12 +532,38 @@ async def mirror_test(interaction: discord.Interaction, url: str, geo: str):
 # ---------------------------------------------------------------------------
 # Bot lifecycle
 # ---------------------------------------------------------------------------
+def _spawn_bg_task(coro):
+    """Schedule a fire-and-forget coroutine while keeping a strong reference."""
+    task = asyncio.create_task(coro)
+    _pending_cleanup_tasks.add(task)
+    task.add_done_callback(_pending_cleanup_tasks.discard)
+    return task
+
+
+def _pause_monitor_sync():
+    """Sync wrapper used by monitor.AlertView's button callback."""
+    return _stop_monitor()
+
+
+def _resume_monitor_sync(delay: int):
+    """Sync wrapper used by monitor.AlertView's button callback."""
+    _spawn_bg_task(_restart_monitor_after_delay(delay))
+
+
 @bot.event
 async def on_ready():
     global _monitor_task
 
     # Register persistent AlertView so buttons survive bot restarts
     bot.add_view(monitor.AlertView())
+
+    # Wire pause/resume so the AlertView "Mirror updated" button can briefly
+    # pause the live monitor while it rotates the mirror — same pattern
+    # /check-redirect uses.
+    monitor.register_monitor_lifecycle(
+        pause=_pause_monitor_sync,
+        resume=_resume_monitor_sync,
+    )
 
     if DEV_GUILD_ID:
         guild = discord.Object(id=int(DEV_GUILD_ID))

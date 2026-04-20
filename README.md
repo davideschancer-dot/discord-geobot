@@ -93,7 +93,7 @@ If RIPE is unavailable (no API key, no credits), falls back to Decodo-only verdi
 - Alerts fire via Discord webhook to a dedicated alerts channel
 - Each alert has two persistent buttons:
   - **Ignore** — mute alerts for this GEO for 1 hour
-  - **Mirror updated** — reset monitoring to the new mirror in `redirects.json`
+  - **Mirror updated** — invokes the same EC2 NordVPN check that `/check-redirect` runs, writes the new mirror to `redirects.json`, and resets monitor state. One click rotates the mirror end-to-end. For `[TEST]` alerts (from `/mirror-test`), the button shows a test-mode acknowledgement and takes no live action
 - No "up" or "recovery" notifications — state clears silently
 - Re-alert after 4 hours if outage is still active and unacknowledged
 - Buttons survive bot restarts (persistent `custom_id` views)
