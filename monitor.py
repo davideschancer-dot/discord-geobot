@@ -99,6 +99,10 @@ PROXY_PASSWORD = os.getenv("PROXY_PASSWORD")
 RIPE_ATLAS_API_KEY = os.getenv("RIPE_ATLAS_API_KEY")
 
 ALERT_WEBHOOK_URL = os.getenv("DISCORD_ALERT_WEBHOOK_URL")
+# Preferred: post alerts as the bot to this channel ID. Required for buttons —
+# Discord rejects interactive components on messages from non-application
+# webhooks. Falls back to the webhook (without buttons) if unset.
+ALERT_CHANNEL_ID = os.getenv("DISCORD_ALERT_CHANNEL_ID")
 
 # Expected Cloudflare IP for mirrors — anything else = DNS hijack
 EXPECTED_IP = "104.24.14.93"
@@ -122,7 +126,7 @@ DECODO_FAILURE_THRESHOLD = int(MONITOR_CFG.get("decodo_failure_threshold", 2))
 # DK/NO/FR/AE — 4-ASN confirmation sets. ALL four must be 100% hijacked.
 CONFIRM_ASNS = {
     "DK": ["3292", "3308", "9158", "31027"],     # TDC, Telenor DK, Stofa/Norlys, Hiper
-    "NO": ["2116", "2119", "25400", "29695"],     # Uninett/Sikt, Telenor Norge, BKK, Get/Telia
+    "NO": ["2116", "5381", "12929", "29695"],     # Uninett/Sikt, Telenor Norway, Telia Norway, Get/Telia
     "FR": ["3215", "5410", "12322", "15557"],     # Orange FR, Bouygues, Free/ProXad, SFR
     "AE": ["5384", "15412", "15802", "45102"],    # du/EITC, FLAG/Etisalat, Etisalat, Alibaba UAE
 }
@@ -250,7 +254,7 @@ class MonitorState:
 # Each returns (status, reason) where status is one of: up, red, orange.
 # ---------------------------------------------------------------------------
 def _host(url: str) -> str:
-    return urllib.parse.urlparse(url).netloc.lower().lstrip("www.")
+    return urllib.parse.urlparse(url).netloc.lower().removeprefix("www.")
 
 
 def check_http(geo_code: str, mirror: str) -> tuple[str, str | None]:
@@ -752,11 +756,9 @@ class AlertView(discord.ui.View):
             return
 
         gs = state.get(code)
+        gs.clear_outage()
         gs.active_mirror = new_mirror
         gs.status = "unknown"
-        gs.consecutive_failures = 0
-        gs.last_alert_sent = None
-        gs.last_alert_message_id = None
         gs.ignored_until = None
         state.save()
 
@@ -781,35 +783,60 @@ async def _send_alert(
     status: str,
     reason: str,
     first_detected: datetime,
+    simulated: bool = False,
 ) -> int | None:
     """
-    Send an alert via the configured webhook, attaching the persistent view.
+    Send an alert. Prefers posting via the bot to ALERT_CHANNEL_ID (so the
+    persistent Ignore / Mirror updated buttons work — Discord rejects
+    interactive components on messages from non-application webhooks). If the
+    channel ID is unset, falls back to the webhook *without* buttons.
     Returns the message_id so state can track it.
+    `simulated=True` prefixes the message so the alert is distinguishable from
+    a real incident in the channel; the rest of the dispatch path is unchanged.
     """
-    if not ALERT_WEBHOOK_URL:
-        log.warning("DISCORD_ALERT_WEBHOOK_URL not set — skipping alert for %s", code)
-        return None
-
     geo_info = GEOS.get(code, {"name": code, "flag": ""})
     emoji = _status_emoji(status)
     level = "DOWN" if status == "red" else "UNCERTAIN"
 
+    header = "🧪 **[TEST]**\n" if simulated else ""
     content = (
+        f"{header}"
         f"{emoji} {geo_info['flag']} **{geo_info['name']} {level}**\n"
         f"Mirror: `{mirror}`\n"
         f"Reason: {reason}\n"
         f"First detected: {first_detected.strftime('%Y-%m-%d %H:%M UTC')}"
     )
 
+    if ALERT_CHANNEL_ID:
+        try:
+            channel = bot.get_channel(int(ALERT_CHANNEL_ID))
+            if channel is None:
+                channel = await bot.fetch_channel(int(ALERT_CHANNEL_ID))
+            msg = await channel.send(content=content, view=AlertView())
+            return msg.id
+        except Exception as e:
+            log.error("Failed to send alert for %s via channel %s: %s",
+                      code, ALERT_CHANNEL_ID, e)
+            return None
+
+    if not ALERT_WEBHOOK_URL:
+        log.warning(
+            "Neither DISCORD_ALERT_CHANNEL_ID nor DISCORD_ALERT_WEBHOOK_URL set "
+            "— skipping alert for %s", code,
+        )
+        return None
+
     try:
-        # aiohttp is bundled with discord.py
+        # Webhook fallback — no buttons (Discord rejects components on
+        # non-application webhook messages).
         import aiohttp
         async with aiohttp.ClientSession() as session:
             webhook = discord.Webhook.from_url(ALERT_WEBHOOK_URL, session=session, client=bot)
-            msg = await webhook.send(
-                content=content,
-                view=AlertView(),
-                wait=True,
+            msg = await webhook.send(content=content, wait=True)
+            log.warning(
+                "Alert for %s sent via webhook fallback — buttons disabled. "
+                "Set DISCORD_ALERT_CHANNEL_ID to enable Ignore / Mirror updated.",
+                code,
             )
             return msg.id
     except Exception as e:
@@ -837,6 +864,17 @@ def _should_alert(gs: GeoState, prev_status: str, now: datetime) -> bool:
     elif not gs.last_alert_sent:
         return True
     return False
+
+
+def _realert_due(gs: GeoState, now: datetime) -> bool:
+    """True if an alert was already fired and the re-alert window has elapsed."""
+    if not gs.alert_fired or not gs.last_alert_sent:
+        return False
+    try:
+        last = datetime.fromisoformat(gs.last_alert_sent)
+    except ValueError:
+        return True
+    return (now - last).total_seconds() >= REALERT_AFTER_HOURS * 3600
 
 
 async def _run_4asn_confirm(
@@ -1003,8 +1041,10 @@ async def run_monitor_cycle(bot: discord.Client) -> None:
                 gs.consecutive_failures += 1
                 log.warning("%s mirror=%s Decodo RED — streak %d/%d — %s",
                             code, mirror, gs.consecutive_failures, DECODO_FAILURE_THRESHOLD, reason)
-                if gs.consecutive_failures >= DECODO_FAILURE_THRESHOLD and not gs.alert_fired:
-                    # Escalate to 4-ASN RIPE confirmation
+                if gs.consecutive_failures >= DECODO_FAILURE_THRESHOLD and (
+                    not gs.alert_fired or _realert_due(gs, now)
+                ):
+                    # Escalate to 4-ASN RIPE confirmation (initial alert or re-alert after 4h)
                     gs.status = "pending"
                     await _run_4asn_confirm(
                         bot, code, mirror, gs, state,
@@ -1126,7 +1166,8 @@ async def _run_ripe_gr_pl_once(
     gs.last_reason = f"Hijacked ASNs: {', '.join(f'AS{a}' for a in hijacked_asns)}"
 
     # Rapid escalation: new ASN hijacked mid-pending-window → alert immediately
-    if gs.pending_confirmation and new_asns and not gs.alert_fired:
+    # (also re-fires if a new ASN appears after the 4h re-alert window has elapsed)
+    if gs.pending_confirmation and new_asns and (not gs.alert_fired or _realert_due(gs, now)):
         log.warning("[%s] RAPID ESCALATION — new ASNs hijacked: %s", cc, new_asns)
         gs.status = "red"
         gs.alert_fired = True
@@ -1165,7 +1206,9 @@ async def _run_ripe_gr_pl_once(
         cc, gs.pending_attempts, PENDING_MAX_ATTEMPTS, len(hijacked_asns),
     )
 
-    if gs.pending_attempts >= PENDING_MAX_ATTEMPTS and not gs.alert_fired:
+    if gs.pending_attempts >= PENDING_MAX_ATTEMPTS and (
+        not gs.alert_fired or _realert_due(gs, now)
+    ):
         gs.status = "red"
         gs.alert_fired = True
         message_id = await _send_alert(
@@ -1306,6 +1349,71 @@ async def run_adhoc_check(
     log.info("adhoc-check %s mirror=%s method=%s status=%s reason=%s",
              code, mirror, method_name, status, reason)
     return status, reason
+
+
+# ---------------------------------------------------------------------------
+# Test alert dispatch — used by /mirror-test when the real check returns red.
+# Reuses the live _send_alert + MonitorState write path so the alert is
+# end-to-end identical to a real one, just labelled [TEST]. State writes go
+# under a sentinel "SIM" code so per-country state is never touched.
+# ---------------------------------------------------------------------------
+SIM_CODE = "SIM"
+
+
+async def dispatch_test_alert(
+    bot: discord.Client,
+    geo_code: str,
+    mirror: str,
+    status: str,
+    reason: str,
+) -> tuple[bool, str]:
+    """
+    Send a [TEST]-labelled alert through the same _send_alert + MonitorState
+    write path the live monitor uses. The alert renders with the chosen geo's
+    flag/name so it reads like a real incident; state goes under SIM_CODE so
+    real per-country state is untouched. Returns (ok, summary) for the caller.
+    """
+    geo_code = geo_code.upper()
+    if geo_code not in GEOS:
+        return False, f"Unknown GEO `{geo_code}`."
+    if not ALERT_CHANNEL_ID and not ALERT_WEBHOOK_URL:
+        return False, (
+            "Neither DISCORD_ALERT_CHANNEL_ID nor DISCORD_ALERT_WEBHOOK_URL is set."
+        )
+
+    now = datetime.now(timezone.utc)
+    log.warning("test-alert sim=true geo=%s target=%s status=%s reason=%s",
+                geo_code, mirror, status, reason)
+
+    state = MonitorState.load()
+    gs = state.get(SIM_CODE)
+    gs.active_mirror = mirror
+    gs.status = status
+    gs.consecutive_failures = (gs.consecutive_failures or 0) + 1
+    gs.last_checked = now.isoformat(timespec="seconds")
+    gs.last_reason = reason
+    gs.alert_fired = True
+    gs.record(mirror=mirror, status=status, reason=reason, at=now)
+
+    message_id = await _send_alert(
+        bot=bot,
+        code=geo_code,
+        mirror=mirror,
+        status=status,
+        reason=reason,
+        first_detected=now,
+        simulated=True,
+    )
+    gs.last_alert_sent = now.isoformat(timespec="seconds")
+    if message_id is not None:
+        gs.last_alert_message_id = message_id
+    state.save()
+
+    log.info("test-alert sim=true dispatched message_id=%s", message_id)
+
+    if message_id is None:
+        return False, "Alert dispatch failed — check the bot log."
+    return True, f"[TEST] alert posted (id {message_id})."
 
 
 # ---------------------------------------------------------------------------

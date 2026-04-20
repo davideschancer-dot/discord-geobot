@@ -34,7 +34,7 @@ process.
 |---|---|
 | `/check-redirect geo:HU` | Pauses the monitor, runs the VPN-based redirect check, saves result to `redirects.json`, updates the channel topic with current mirrors, resumes monitor after 60s |
 | `/redirect-status` | Shows the current saved redirects for all GEOs |
-| `/mirror-test url:domain.com geo:HU` | On-demand block test for any domain. Runs Decodo HTTP + RIPE DNS checks and returns a traffic light verdict. Simulation only — does not affect live monitoring |
+| `/mirror-test url:domain.com geo:HU` | On-demand block test for any domain. Runs Decodo HTTP + RIPE DNS checks and returns a traffic light verdict. When the verdict is RED, also dispatches a `[TEST]`-labelled alert through the same pipeline the live monitor uses — useful for demoing what a real outage alert looks like. Does not affect per-country live monitoring state |
 
 ## Monitor check methods
 
@@ -77,6 +77,12 @@ Both Decodo HTTP and RIPE DNS checks run concurrently. The result is a traffic l
 For **Hungary**, only Decodo runs (no RIPE) because HU uses HTTP-level blocking, not DNS hijacking.
 If RIPE is unavailable (no API key, no credits), falls back to Decodo-only verdict.
 
+## /mirror-test alert dispatch
+
+`/mirror-test` always returns the traffic-light verdict embed. When the verdict is **RED**, it additionally dispatches a `[TEST]`-labelled alert through the same `_send_alert` + `MonitorState` write path the live monitor uses — same channel, same Ignore / Mirror updated buttons. State writes are routed under a sentinel `SIM` geo code so per-country live state is untouched. Logs include `sim=true` for grepping. Use this to demo what a real outage alert looks like end-to-end.
+
+> **Buttons require channel posting.** Set `DISCORD_ALERT_CHANNEL_ID` so the bot posts directly. Webhook posting (`DISCORD_ALERT_WEBHOOK_URL`) is supported as a fallback but Discord rejects interactive components on non-application webhooks, so buttons are dropped in that path.
+
 ## Alert system
 
 - Alerts fire via Discord webhook to a dedicated alerts channel
@@ -107,7 +113,8 @@ If RIPE is unavailable (no API key, no credits), falls back to Decodo-only verdi
 | Variable | Used by | Purpose |
 |---|---|---|
 | `DISCORD_BOT_TOKEN` | Bot | Discord gateway connection |
-| `DISCORD_ALERT_WEBHOOK_URL` | Monitor | Webhook URL for the alerts channel |
+| `DISCORD_ALERT_CHANNEL_ID` | Monitor | Channel ID where the bot posts alerts (required for buttons) |
+| `DISCORD_ALERT_WEBHOOK_URL` | Monitor | Fallback webhook for alerts when channel ID is unset (no buttons) |
 | `REDIRECT_CHECKER_URL` | Bot | EC2 redirect checker (`http://127.0.0.1:8080` on EC2) |
 | `REDIRECT_CHECKER_KEY` | Bot | Shared secret for the checker API |
 | `PROXY_HOST` / `PROXY_PORT` | Monitor | Decodo residential proxy endpoint |

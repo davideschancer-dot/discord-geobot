@@ -33,6 +33,11 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 
+# Optional: when set, slash commands are synced to this guild only — instant
+# update for dev iteration. Leave unset in production for the normal global
+# sync (which Discord caches up to ~1h).
+DEV_GUILD_ID = os.getenv("DEV_GUILD_ID")
+
 # EC2 redirect checker endpoint (NordVPN Hungary tunnel)
 REDIRECT_CHECKER_URL = os.getenv(
     "REDIRECT_CHECKER_URL",
@@ -503,7 +508,28 @@ async def mirror_test(interaction: discord.Interaction, url: str, geo: str):
         dns_text = "No RIPE data"
 
     embed.add_field(name="DNS Check", value=dns_text, inline=False)
-    embed.set_footer(text="Simulation only \u2014 does not affect live monitoring")
+
+    # When the test verdict is RED, dispatch a [TEST]-labelled alert through
+    # the same pipeline the live monitor uses, so the team can see exactly
+    # what a real outage alert would look like. State writes go under the SIM
+    # sentinel so per-country state is untouched.
+    test_alert_note = "Real check — does not affect live monitoring."
+    if verdict == "red":
+        try:
+            ok, summary = await monitor.dispatch_test_alert(
+                bot=bot,
+                geo_code=geo,
+                mirror=domain,
+                status="red",
+                reason=(http_display or http_reason or "Test alert from /mirror-test"),
+            )
+            test_alert_note = (
+                f"[TEST] alert dispatched to alerts channel — {summary}"
+                if ok else f"Test alert NOT dispatched — {summary}"
+            )
+        except Exception as e:
+            test_alert_note = f"Test alert dispatch raised `{type(e).__name__}: {e}`"
+    embed.set_footer(text=test_alert_note)
 
     await interaction.followup.send(embed=embed)
 
@@ -518,9 +544,16 @@ async def on_ready():
     # Register persistent AlertView so buttons survive bot restarts
     bot.add_view(monitor.AlertView())
 
-    synced = await tree.sync()
+    if DEV_GUILD_ID:
+        guild = discord.Object(id=int(DEV_GUILD_ID))
+        tree.copy_global_to(guild=guild)
+        synced = await tree.sync(guild=guild)
+        scope = f"guild {DEV_GUILD_ID} (dev, instant)"
+    else:
+        synced = await tree.sync()
+        scope = "global (cached up to ~1h)"
     print(f"Bot ready — logged in as {bot.user} (ID: {bot.user.id})", flush=True)
-    print(f"Synced {len(synced)} commands: {[c.name for c in synced]}", flush=True)
+    print(f"Synced {len(synced)} commands [{scope}]: {[c.name for c in synced]}", flush=True)
     print(f"GEOs loaded: {', '.join(GEO_MAP.keys())}", flush=True)
 
     # Start the background monitor loop
