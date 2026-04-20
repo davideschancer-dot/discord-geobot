@@ -15,22 +15,22 @@ Greece uses ISP DNS hijacking. Detection uses RIPE Atlas DNS measurements target
 ### Poland (PL) — RIPE Atlas reliable-ASN
 Same method as Greece. Reliable ASN is Orange Polska (AS5617). Peer ASNs: GTS/T-Mobile AS5588, T-Mobile PL AS12912, Vectra AS29314, Multimedia Polska AS21021. Same twice-daily schedule, same 3-attempt pending window.
 
-### Denmark (DK) — Decodo HTTP + weekly RIPE + 4-ASN confirm
-Denmark has court-ordered DNS blocks (Lotteritilsynet). Primary detection is Decodo residential proxy HTTP requests every 10 minutes (same as the legacy HTTP check — tests whether the mirror loads through a Danish residential IP). When two consecutive Decodo failures occur, the system escalates to a 4-ASN RIPE Atlas confirmation: DNS measurements are run against four Danish ISPs (TDC AS3292, Telenor DK AS3308, Stofa/Norlys AS9158, Hiper AS31027). ALL FOUR ASNs must show 100% DNS hijack (every probe on every ASN resolves to the wrong IP) for an alert to fire. A weekly RIPE sweep also runs on Monday 04:00 UTC as a proactive check regardless of Decodo status.
+### Denmark (DK) — daily single-ASN RIPE check
+Denmark has court-ordered DNS blocks (Lotteritilsynet). Detection is one RIPE Atlas DNS measurement per day, fired at 04:00 UTC against the reliable ASN TDC AS3292 (Nuuday). If the resolved IP is not the expected Cloudflare IP (104.24.14.93), an alert fires immediately. Re-alerts every 4h while still hijacked. Detection latency up to ~24h is the explicit trade-off for staying within the RIPE credit budget. Decodo is not used for DK.
 
-### Norway (NO) — Decodo HTTP + weekly RIPE + 4-ASN confirm
-Same method as Denmark. Court-ordered DNS blocks (Lotteritilsynet). Confirm ASNs: Uninett/Sikt AS2116, Telenor Norway AS5381, Telia Norway AS12929, Get/Telia AS29695.
+### Norway (NO) — daily single-ASN RIPE check
+Same method as Denmark. Court-ordered DNS blocks (Lotteritilsynet). Reliable ASN: Telenor Norway AS5381.
 
-### France (FR) — Decodo HTTP + weekly RIPE + 4-ASN confirm
-Same method as Denmark. ANJ DNS blocks. Confirm ASNs: Orange FR AS3215, Bouygues Telecom AS5410, Free/ProXad AS12322, SFR AS15557.
+### France (FR) — daily single-ASN RIPE check
+Same method as Denmark. ANJ DNS blocks. Reliable ASN: Orange France AS3215.
 
-### UAE (AE) — Decodo HTTP + weekly RIPE + 4-ASN confirm
-Same method as Denmark. National DNS hijack — block pages served at Cloudflare IPs 104.16.130.238 / 104.16.131.238 (these are NOT the real site; any resolved IP other than 104.24.14.93 counts as hijacked). Confirm ASNs: du/EITC AS5384, FLAG Telecom/Etisalat AS15412, Etisalat AS15802, Alibaba UAE AS45102.
+### UAE (AE) — daily single-ASN RIPE check
+Same method as Denmark. National DNS hijack — block pages served at Cloudflare IPs 104.16.130.238 / 104.16.131.238 (these are NOT the real site; any resolved IP other than 104.24.14.93 counts as hijacked). Reliable ASN: FLAG Telecom / Etisalat AS15412.
 
 ## Core design principles
 
 ### No false positives — confirmed alerts only
-Every alert path requires multi-source confirmation before firing. A single proxy error, a single DNS timeout, a single ASN returning a bad result — none of these produce an alert on their own. The system is designed to stay silent unless a block is genuinely confirmed across multiple independent vantage points.
+The Tier 1 paths require multi-source confirmation: HU needs 6 consecutive all-ASN-blocked cycles; GR/PL need 3 confirmed pending-window samples. The Tier 3 daily check (DK/FR/NO/AE) intentionally trades multi-ASN confirmation for credit efficiency — it relies on the reliable-ASN signal alone, accepting the higher false-positive risk of a single ASN check in exchange for a ~99% credit reduction. RIPE measurement errors are never treated as a "clean" signal: when all per-ASN measurements fail, the result is flagged as `ripe_unavailable` upstream and existing state is preserved.
 
 ### No "up" or "recovery" notifications
 The system only alerts on confirmed outages. When a mirror comes back up, it silently clears internal state. The team does not receive "recovered" messages — they create noise and the team already knows when they've rotated a mirror.

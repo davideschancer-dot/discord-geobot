@@ -18,9 +18,10 @@ Discord           discord_bot.py (EC2)           monitor.py (same process)
                                                 every 10 min:
                                                   HU: Decodo per-ASN consensus
                                                   GR/PL: RIPE Atlas (04:00/16:00 UTC)
-                                                  DK/NO/FR/AE: Decodo + RIPE confirm
+                                                  DK/NO/FR/AE: daily single-ASN
+                                                              RIPE @ 04:00 UTC
                                                   ↓
-                                                alert via Discord webhook
+                                                alert via DISCORD_ALERT_CHANNEL_ID
                                                   [Ignore] [Mirror updated]
 ```
 
@@ -38,9 +39,9 @@ process.
 
 ## Monitor check methods
 
-The background monitor uses three different strategies depending on the country:
+The background monitor uses three strategies grouped by tier of monitoring priority. HU/GR/PL are real-time; DK/FR/NO/AE are credit-conscious daily.
 
-### Hungary (`hu_consensus`)
+### Hungary (`hu_consensus`) — Tier 1 real-time, zero RIPE
 - **Decodo only** — Hungary uses HTTP-level blocking (SZTFH block pages), not DNS hijacking, so RIPE Atlas is not used
 - Decodo residential proxy with **per-ASN routing** every 10 minutes
 - Checks 4 Hungarian ISP ASNs in parallel: Magyar Telekom, Vodafone, DIGI, Yettel
@@ -48,18 +49,22 @@ The background monitor uses three different strategies depending on the country:
 - **6 consecutive** all-blocked cycles required before an alert fires
 - Block detection: SZTFH government block pages, SSL resets, CF hard blocks, ISP redirects
 
-### Greece & Poland (`ripe_reliable_asn`)
+### Greece & Poland (`ripe_reliable_asn`) — Tier 1 real-time
 - RIPE Atlas DNS measurements **twice daily** at 04:00 and 16:00 UTC
 - Reliable ASN (Cosmote for GR, Orange Polska for PL) plus peer ASNs
 - If reliable ASN is hijacked (resolved IP != 104.24.14.93), enters pending-confirmation
 - **3 confirmed results**, each spaced **60 minutes apart**, required before alert
 - **Rapid escalation**: if a NEW ASN becomes hijacked mid-window, alert fires immediately
 
-### DK, NO, FR, AE (`decodo_plus_ripe_confirm`)
-- Primary: Decodo HTTP check every 10 minutes (single proxy, no per-ASN)
-- After **3 consecutive** Decodo failures, escalates to 4-ASN RIPE confirmation
-- ALL 4 configured confirm ASNs must show 100% DNS hijack before alert fires
-- Weekly proactive RIPE sweep on **Monday 04:00 UTC**
+### DK, NO, FR, AE (`ripe_daily_single_asn`) — Tier 3 credit-conscious daily
+- One RIPE Atlas DNS measurement per geo, fired **once at 04:00 UTC** against the country's reliable ASN (TDC for DK, Telenor NO for NO, Orange FR for FR, FLAG/Etisalat for AE)
+- Hijack on the reliable ASN → alert immediately. Re-alerts every 4h while still hijacked
+- Detection latency up to ~24h is the trade-off for ~99% RIPE credit reduction vs the previous Decodo+4-ASN approach
+- Decodo is no longer used for these geos
+
+### RIPE credit guard rails
+- All RIPE measurement creation is gated by a credit floor (`monitor.ripe_credit_floor` in `config.yaml`, default 50). When the cached balance falls below the floor, measurements are skipped and `ripe_skipped reason=low_credit` is logged
+- "All measurements errored" is treated as `ripe_unavailable` upstream, not as zero-hijacks-clean. The live monitor preserves outage state on no-data cycles; `/mirror-test` falls through to the Decodo-only verdict path
 
 ## /mirror-test — on-demand block testing
 

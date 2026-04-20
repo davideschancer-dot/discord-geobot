@@ -107,23 +107,35 @@ ALERT_CHANNEL_ID = os.getenv("DISCORD_ALERT_CHANNEL_ID")
 # Expected Cloudflare IP for mirrors — anything else = DNS hijack
 EXPECTED_IP = "104.24.14.93"
 
-# GR/PL reliable ASN — if this ASN is hijacked, enter pending-confirmation
+# Reliable single ASN per GEO. GR/PL use this for pending-confirmation entry;
+# DK/FR/NO/AE use it for the once-daily single-ASN check (Tier 3).
 RELIABLE_ASN = {
     "GR": "1241",    # OTE / Cosmote
     "PL": "5617",    # Orange Polska
+    "DK": "3292",    # TDC / Nuuday
+    "NO": "5381",    # Telenor Norway
+    "FR": "3215",    # Orange France
+    "AE": "15412",   # FLAG Telecom / Etisalat
 }
 
 # GR/PL pending-confirmation parameters
 PENDING_RETRY_MINUTES = 60
 PENDING_MAX_ATTEMPTS = 3
 
-# RIPE Atlas scheduled check times (UTC hours)
+# GR/PL scheduled check times (UTC hours)
 RIPE_SCHEDULE_HOURS = [4, 16]
 
-# DK/NO/FR/AE — consecutive Decodo failures before 4-ASN RIPE confirmation
-DECODO_FAILURE_THRESHOLD = int(MONITOR_CFG.get("decodo_failure_threshold", 2))
+# DK/FR/NO/AE — daily single-ASN RIPE check fires once at this UTC hour
+DAILY_RIPE_HOUR = 4
 
-# DK/NO/FR/AE — 4-ASN confirmation sets. ALL four must be 100% hijacked.
+# RIPE credit floor — measurements are skipped when current balance falls
+# below this threshold so we never silently exhaust credits or starve
+# higher-priority geos. Tunable via monitor.ripe_credit_floor in config.yaml.
+RIPE_CREDIT_FLOOR = int(MONITOR_CFG.get("ripe_credit_floor", 50))
+
+# Kept only because /mirror-test still surfaces a 4-ASN snapshot for
+# stakeholders. The live monitor no longer escalates to a 4-ASN confirm
+# (Tier 3 geos run the daily single-ASN check instead).
 CONFIRM_ASNS = {
     "DK": ["3292", "3308", "9158", "31027"],     # TDC, Telenor DK, Stofa/Norlys, Hiper
     "NO": ["2116", "5381", "12929", "29695"],     # Uninett/Sikt, Telenor Norway, Telia Norway, Get/Telia
@@ -454,6 +466,41 @@ def check_hu_consensus(geo_code: str, mirror: str) -> tuple[str, str | None]:
 # ---------------------------------------------------------------------------
 RIPE_API_BASE = "https://atlas.ripe.net/api/v2"
 
+# Credit-balance cache. (balance, fetched_at_monotonic)
+_RIPE_CREDIT_CACHE: dict[str, float | int | None] = {"balance": None, "at": 0.0}
+_RIPE_CREDIT_TTL_SECONDS = 60
+
+
+def _ripe_credits_available() -> int | None:
+    """
+    Return current RIPE Atlas credit balance, or None on error / no API key.
+    Cached for _RIPE_CREDIT_TTL_SECONDS so a single cycle's worth of
+    measurement creations doesn't hammer the credits endpoint.
+    """
+    if not RIPE_ATLAS_API_KEY:
+        return None
+    now = time.monotonic()
+    cached_at = _RIPE_CREDIT_CACHE.get("at") or 0.0
+    if now - cached_at < _RIPE_CREDIT_TTL_SECONDS:
+        cached = _RIPE_CREDIT_CACHE.get("balance")
+        if isinstance(cached, int):
+            return cached
+    try:
+        resp = requests.get(
+            f"{RIPE_API_BASE}/credits/",
+            headers={"Authorization": f"Key {RIPE_ATLAS_API_KEY}"},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            balance = int(resp.json().get("current_balance", 0))
+            _RIPE_CREDIT_CACHE["balance"] = balance
+            _RIPE_CREDIT_CACHE["at"] = now
+            return balance
+        log.warning("RIPE credits endpoint returned HTTP %d", resp.status_code)
+    except Exception as e:
+        log.warning("Failed to read RIPE credit balance: %s", e)
+    return None
+
 
 def _ripe_create_measurement(
     domain: str,
@@ -464,9 +511,19 @@ def _ripe_create_measurement(
     """
     Create a one-off RIPE Atlas DNS A-record measurement for `domain`,
     targeting probes in `country_code` on `asn`. Returns measurement ID.
+    Skipped (returns None with a logged reason) when the credit balance is
+    below RIPE_CREDIT_FLOOR — never silently exhaust credits.
     """
     if not RIPE_ATLAS_API_KEY:
         log.warning("RIPE_ATLAS_API_KEY not set — cannot create measurement")
+        return None
+
+    balance = _ripe_credits_available()
+    if balance is not None and balance < RIPE_CREDIT_FLOOR:
+        log.warning(
+            "ripe_skipped reason=low_credit balance=%d floor=%d cc=%s asn=%s",
+            balance, RIPE_CREDIT_FLOOR, country_code, asn,
+        )
         return None
 
     payload = {
@@ -673,10 +730,12 @@ def ripe_check_per_asn(
                      result["asn"], result["hijacked"], result["ips"], result["error"])
 
     hijacked_asns = [asn for asn, r in per_asn.items() if r["hijacked"]]
+    all_errored = len(per_asn) > 0 and all(r.get("error") for r in per_asn.values())
     return {
         "per_asn": per_asn,
         "hijacked_asns": hijacked_asns,
         "all_hijacked": len(hijacked_asns) == len(asns) and len(asns) > 0,
+        "all_errored": all_errored,
     }
 
 
@@ -877,60 +936,6 @@ def _realert_due(gs: GeoState, now: datetime) -> bool:
     return (now - last).total_seconds() >= REALERT_AFTER_HOURS * 3600
 
 
-async def _run_4asn_confirm(
-    bot: discord.Client,
-    code: str,
-    mirror: str,
-    gs: GeoState,
-    state: "MonitorState",
-    trigger: str,
-) -> None:
-    """
-    Run 4-ASN RIPE confirmation for DK/NO/FR/AE. Only alerts if ALL
-    configured confirm ASNs show 100% DNS hijack.
-    """
-    asns = CONFIRM_ASNS.get(code, [])
-    if not asns:
-        log.warning("[%s] No CONFIRM_ASNS defined — cannot confirm", code)
-        return
-
-    if not RIPE_ATLAS_API_KEY:
-        log.warning("[%s] RIPE_ATLAS_API_KEY not set — cannot run 4-ASN confirm", code)
-        return
-
-    log.info("[%s] Running 4-ASN RIPE confirm (%s) — ASNs %s", code, trigger, asns)
-    now = datetime.now(timezone.utc)
-
-    loop = asyncio.get_running_loop()
-    summary = await loop.run_in_executor(
-        None, ripe_check_per_asn, mirror, code, asns
-    )
-
-    hijacked = summary["hijacked_asns"]
-    all_hijacked = summary["all_hijacked"]
-
-    if all_hijacked:
-        gs.status = "red"
-        gs.alert_fired = True
-        message_id = await _send_alert(
-            bot=bot, code=code, mirror=mirror, status="red",
-            reason=(
-                f"All {len(asns)} confirm ASNs 100% hijacked — "
-                f"{trigger} + RIPE 4/4 ({', '.join(f'AS{a}' for a in asns)})"
-            ),
-            first_detected=now,
-        )
-        gs.last_alert_sent = now.isoformat(timespec="seconds")
-        if message_id is not None:
-            gs.last_alert_message_id = message_id
-        log.warning("[%s] 4-ASN CONFIRM: ALL hijacked — ALERT FIRED", code)
-    else:
-        log.info(
-            "[%s] 4-ASN confirm did NOT reach 4/4 — hijacked: %s — suppressing alert",
-            code, hijacked,
-        )
-        # Don't alert, but keep the failure streak so next Decodo failure re-triggers
-    state.save()
 
 
 # ---------------------------------------------------------------------------
@@ -955,8 +960,9 @@ async def run_monitor_cycle(bot: discord.Client) -> None:
     for code, geo in GEOS.items():
         if not geo["monitor"]:
             continue
-        # GR/PL use scheduled RIPE checks, not the regular cycle
-        if geo["check_method"] == "ripe_reliable_asn":
+        # GR/PL use scheduled RIPE checks; DK/FR/NO/AE use the daily single-ASN
+        # runner. Both are out of band of this 10-minute cycle.
+        if geo["check_method"] in ("ripe_reliable_asn", "ripe_daily_single_asn"):
             continue
 
         gs = state.get(code)
@@ -981,9 +987,7 @@ async def run_monitor_cycle(bot: discord.Client) -> None:
 
         # Run the configured check method in a thread
         check_method = geo["check_method"]
-
-        # decodo_plus_ripe_confirm uses check_http for the primary Decodo check
-        method = CHECK_METHODS.get("http" if check_method == "decodo_plus_ripe_confirm" else check_method)
+        method = CHECK_METHODS.get(check_method)
         if not method:
             log.error("%s: unknown check_method '%s'", code, check_method)
             continue
@@ -1026,30 +1030,6 @@ async def run_monitor_cycle(bot: discord.Client) -> None:
             else:
                 # inconclusive — preserve streak, don't count as failure
                 log.info("%s mirror=%s inconclusive — streak preserved at %d", code, mirror, gs.consecutive_failures)
-
-        # --- DK/NO/FR/AE: Decodo + RIPE confirm path ---
-        elif check_method == "decodo_plus_ripe_confirm":
-            if status == "up":
-                gs.clear_outage()
-                log.info("%s mirror=%s UP via Decodo", code, mirror)
-            elif status == "orange":
-                # Proxy error — don't count as failure, preserve streak
-                log.info("%s mirror=%s Decodo orange (%s) — streak preserved at %d",
-                         code, mirror, reason, gs.consecutive_failures)
-            else:
-                # red — Decodo sees a block signal
-                gs.consecutive_failures += 1
-                log.warning("%s mirror=%s Decodo RED — streak %d/%d — %s",
-                            code, mirror, gs.consecutive_failures, DECODO_FAILURE_THRESHOLD, reason)
-                if gs.consecutive_failures >= DECODO_FAILURE_THRESHOLD and (
-                    not gs.alert_fired or _realert_due(gs, now)
-                ):
-                    # Escalate to 4-ASN RIPE confirmation (initial alert or re-alert after 4h)
-                    gs.status = "pending"
-                    await _run_4asn_confirm(
-                        bot, code, mirror, gs, state,
-                        trigger=f"Decodo {gs.consecutive_failures} consecutive failures",
-                    )
 
         # --- Standard HTTP/DNS path (fallback) ---
         else:
@@ -1141,6 +1121,17 @@ async def _run_ripe_gr_pl_once(
     summary = await loop.run_in_executor(
         None, ripe_check_per_asn, mirror, cc, all_asns
     )
+
+    # No data — every measurement errored (e.g. RIPE credits exhausted).
+    # Do NOT mutate state: an empty hijacked_asns list with all-errors must
+    # never silently clear a real pending-confirmation window.
+    if summary.get("all_errored"):
+        first_err = next(
+            (r.get("error") for r in summary["per_asn"].values() if r.get("error")),
+            "unknown",
+        )
+        log.warning("[%s] ripe_unavailable reason=%s — preserving state", cc, first_err)
+        return
 
     hijacked_asns = summary["hijacked_asns"]
     reliable_hijacked = reliable and reliable in hijacked_asns
@@ -1274,52 +1265,124 @@ async def tick_pending_retries(bot: discord.Client) -> None:
 
 
 # ---------------------------------------------------------------------------
-# DK/NO/FR/AE — weekly RIPE proactive sweep (Monday 04:00 UTC)
+# DK/FR/NO/AE — daily single-ASN RIPE check (Tier 3, runs once at 04 UTC)
 # ---------------------------------------------------------------------------
-async def run_weekly_ripe_sweep(bot: discord.Client) -> None:
+async def run_daily_single_asn_check(bot: discord.Client) -> None:
     """
-    Proactive country-level RIPE check for DK/NO/FR/AE.
-    If any country shows DNS hijack, trigger 4-ASN confirmation.
+    Iterate every geo with check_method == 'ripe_daily_single_asn' and
+    monitor: true. Fire exactly one RIPE measurement against the geo's
+    reliable ASN. Alert on hijack; clear outage on clean. No state mutation
+    when the measurement errors (e.g. low credit).
     """
     state = MonitorState.load()
     redirects = _load_redirects()
+    now = datetime.now(timezone.utc)
+    loop = asyncio.get_running_loop()
 
-    for cc in ("DK", "NO", "FR", "AE"):
-        geo = GEOS.get(cc)
-        if not geo or not geo["monitor"]:
+    for code, geo in GEOS.items():
+        if not geo["monitor"] or geo["check_method"] != "ripe_daily_single_asn":
             continue
-        mirror = (redirects.get(cc) or {}).get("mirror")
+
+        gs = state.get(code)
+
+        # Respect ignore window
+        if gs.ignored_until:
+            try:
+                if datetime.fromisoformat(gs.ignored_until) > now:
+                    log.info("[%s] ignored — skipping daily RIPE check", code)
+                    continue
+                gs.ignored_until = None
+            except ValueError:
+                gs.ignored_until = None
+
+        mirror = (redirects.get(code) or {}).get("mirror")
         if not mirror:
-            log.warning("[%s] No mirror in redirects.json — skipping weekly sweep", cc)
+            log.warning("[%s] No mirror in redirects.json — skipping daily check", code)
             continue
 
-        gs = state.get(cc)
-        if gs.alert_fired:
-            log.info("[%s] Alert already fired — skipping weekly sweep", cc)
+        asn = RELIABLE_ASN.get(code)
+        if not asn:
+            log.error("[%s] No RELIABLE_ASN configured — skipping daily check", code)
             continue
 
-        # Run a country-level RIPE check using the confirm ASNs
-        asns = CONFIRM_ASNS.get(cc, [])
-        if not asns:
-            continue
-
-        log.info("[%s] Weekly RIPE sweep — checking ASNs %s", cc, asns)
+        log.info("[%s] Daily single-ASN RIPE check — AS%s @ %s", code, asn, mirror)
         try:
-            loop = asyncio.get_running_loop()
-            summary = await loop.run_in_executor(
-                None, ripe_check_per_asn, mirror, cc, asns
+            result = await loop.run_in_executor(
+                None, ripe_check_asn, mirror, code, asn,
             )
-            if summary["hijacked_asns"]:
-                log.warning("[%s] Weekly sweep found hijacked ASNs: %s — running 4-ASN confirm",
-                            cc, summary["hijacked_asns"])
-                await _run_4asn_confirm(
-                    bot, cc, mirror, gs, state,
-                    trigger="Weekly RIPE sweep detected hijack",
-                )
-            else:
-                log.info("[%s] Weekly sweep clean", cc)
         except Exception as e:
-            log.error("[%s] Weekly sweep failed: %s", cc, e, exc_info=True)
+            log.error("[%s] Daily check raised %s: %s", code, type(e).__name__, e)
+            continue
+
+        # No data — measurement errored (low credit, API failure). Do not
+        # mutate state: must not flip a real outage to "clean".
+        if result.get("error"):
+            log.warning("[%s] ripe_unavailable cc=%s reason=%s — preserving state",
+                        code, code, result["error"])
+            continue
+
+        gs.active_mirror = mirror
+        gs.last_checked = now.isoformat(timespec="seconds")
+        gs.record(
+            mirror=mirror,
+            status="hijacked" if result["hijacked"] else "up",
+            reason=f"Daily single-ASN: AS{asn} ips={result['ips']}",
+            at=now,
+        )
+
+        if result["hijacked"]:
+            ips = ", ".join(result["ips"]) or "no IPs"
+            reason = (
+                f"Daily RIPE single-ASN check: AS{asn} hijacked, IPs={ips}"
+            )
+            gs.last_reason = reason
+            prev_status = gs.status
+            gs.status = "red"
+
+            # Fire on first detection, or on the 4h re-alert window.
+            if not gs.alert_fired or _realert_due(gs, now):
+                gs.alert_fired = True
+                message_id = await _send_alert(
+                    bot=bot, code=code, mirror=mirror, status="red",
+                    reason=reason, first_detected=now,
+                )
+                gs.last_alert_sent = now.isoformat(timespec="seconds")
+                if message_id is not None:
+                    gs.last_alert_message_id = message_id
+                log.warning("[%s] Daily check ALERT fired (prev_status=%s)",
+                            code, prev_status)
+            else:
+                log.info("[%s] Daily check still hijacked — alert suppressed (within re-alert window)",
+                         code)
+        else:
+            # Clean — silently clear outage state if it was set.
+            if gs.status == "red" or gs.alert_fired:
+                log.info("[%s] Daily check clean — clearing outage state", code)
+            gs.clear_outage()
+            gs.last_reason = None
+
+    state.save()
+
+
+def migrate_legacy_decodo_state() -> None:
+    """
+    One-shot startup cleanup: any geo now using ripe_daily_single_asn that
+    still carries Decodo-era streak/alert state from the old check method
+    gets a clean slate. The daily runner doesn't read those fields, so
+    leftover values would just be misleading in monitor_state.json.
+    """
+    state = MonitorState.load()
+    changed = False
+    for code, geo in GEOS.items():
+        if geo.get("check_method") != "ripe_daily_single_asn":
+            continue
+        gs = state.get(code)
+        if gs.consecutive_failures > 0 or gs.alert_fired:
+            log.info("[%s] migrating legacy Decodo state — clearing outage flags", code)
+            gs.clear_outage()
+            changed = True
+    if changed:
+        state.save()
 
 
 # ---------------------------------------------------------------------------
@@ -1425,17 +1488,25 @@ def create_monitor_task(bot: discord.Client) -> tasks.Loop:
     configured interval. Also handles:
       - GR/PL scheduled RIPE checks at 04:00 and 16:00 UTC
       - GR/PL pending-confirmation retry ticks
+      - DK/FR/NO/AE daily single-ASN RIPE check at DAILY_RIPE_HOUR UTC
     Caller is responsible for .start()ing it after the bot is ready.
     """
-    # Track the last hour we ran RIPE scheduled checks to avoid double-firing
+    # One-shot cleanup of leftover Decodo-era state for any geo now on
+    # ripe_daily_single_asn. Cheap, safe to run on every startup.
+    try:
+        migrate_legacy_decodo_state()
+    except Exception as e:
+        log.error("Legacy state migration failed: %s", e, exc_info=True)
+
+    # Track the last hour each scheduled job ran to avoid double-firing.
     _last_ripe_hour: dict[str, int | None] = {"value": None}
-    _last_weekly_sweep_date: dict[str, str | None] = {"value": None}
+    _last_daily_ripe_date: dict[str, str | None] = {"value": None}
 
     @tasks.loop(minutes=INTERVAL_MINUTES)
     async def monitor_loop():
         now = datetime.now(timezone.utc)
 
-        # --- Regular HTTP cycle (HU + DK/NO/FR/AE Decodo) ---
+        # --- Regular HTTP cycle (HU only — DK/NO/FR/AE moved to daily) ---
         try:
             await run_monitor_cycle(bot)
         except Exception as e:
@@ -1454,16 +1525,14 @@ def create_monitor_task(bot: discord.Client) -> tasks.Loop:
         if current_hour not in RIPE_SCHEDULE_HOURS:
             _last_ripe_hour["value"] = None
 
-        # --- DK/NO/FR/AE weekly RIPE sweep — Monday 04:00 UTC ---
+        # --- DK/FR/NO/AE daily single-ASN RIPE check at DAILY_RIPE_HOUR UTC ---
         today_str = now.strftime("%Y-%m-%d")
-        if (now.weekday() == 0  # Monday
-                and current_hour == 4
-                and _last_weekly_sweep_date["value"] != today_str):
-            _last_weekly_sweep_date["value"] = today_str
+        if current_hour == DAILY_RIPE_HOUR and _last_daily_ripe_date["value"] != today_str:
+            _last_daily_ripe_date["value"] = today_str
             try:
-                await run_weekly_ripe_sweep(bot)
+                await run_daily_single_asn_check(bot)
             except Exception as e:
-                print(f"[monitor] Weekly RIPE sweep error: {type(e).__name__}: {e}", flush=True)
+                print(f"[monitor] Daily RIPE check error: {type(e).__name__}: {e}", flush=True)
 
         # --- GR/PL pending-confirmation retry ticks ---
         try:

@@ -20,8 +20,10 @@ monitor:
   ignore_duration_hours: 1
   # HU-specific: consecutive all-ASN-blocked cycles before alert fires.
   failure_threshold_hu: 6
-  # DK/NO/FR/AE: consecutive Decodo failures before 4-ASN RIPE confirmation.
-  decodo_failure_threshold: 3
+  # RIPE Atlas credit floor — measurements are skipped when the cached
+  # balance falls below this number, so we never silently exhaust credits
+  # or starve higher-priority geos. Cached for 60s.
+  ripe_credit_floor: 50
 
 # ---------------------------------------------------------------------------
 # GEOs
@@ -77,22 +79,23 @@ geos:
   - code: DK
     name: Denmark
     flag: "🇩🇰"
-    check_method: decodo_plus_ripe_confirm
+    check_method: ripe_daily_single_asn
     monitor: true
-    # Confirm ASNs hardcoded in monitor.py CONFIRM_ASNS
+    # Reliable ASN for the daily single-ASN check is hardcoded in
+    # monitor.py RELIABLE_ASN (DK -> AS3292 TDC / Nuuday)
   - code: FR
     name: France
     flag: "🇫🇷"
-    check_method: decodo_plus_ripe_confirm
+    check_method: ripe_daily_single_asn
     monitor: true
   - code: AE
     name: UAE
     flag: "🇦🇪"
-    check_method: decodo_plus_ripe_confirm
+    check_method: ripe_daily_single_asn
     monitor: true
     # Block pages at CF 104.16.130.238/104.16.131.238 (NOT the real site)
   - code: "NO"
     name: Norway
     flag: "🇳🇴"
-    check_method: decodo_plus_ripe_confirm
+    check_method: ripe_daily_single_asn
     monitor: true

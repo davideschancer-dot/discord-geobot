@@ -406,12 +406,24 @@ async def mirror_test(interaction: discord.Interaction, url: str, geo: str):
 
     ripe_summary = None
     ripe_failed = False
+    ripe_first_error: str | None = None
     if ripe_fut is not None:
         try:
             ripe_summary = await ripe_fut
         except Exception as e:
             ripe_failed = True
             print(f"[mirror-test] RIPE check failed: {e}", flush=True)
+
+    # Treat "every per-ASN measurement errored" as RIPE unavailable, not as
+    # zero-hijacks-clean. Otherwise low-credit / API outages produce a
+    # false-clean signal that biases the verdict toward green/orange.
+    if ripe_summary and ripe_summary.get("all_errored"):
+        ripe_failed = True
+        ripe_first_error = next(
+            (r.get("error") for r in ripe_summary["per_asn"].values() if r.get("error")),
+            None,
+        )
+        print(f"[mirror-test] RIPE all-errored — treating as unavailable: {ripe_first_error}", flush=True)
 
     # --- Traffic light verdict ---
     hijacked_count = 0
@@ -493,6 +505,8 @@ async def mirror_test(interaction: discord.Interaction, url: str, geo: str):
             dns_text += " (RIPE API key not set)"
         elif not asns:
             dns_text += " (no ASNs configured for this GEO)"
+        elif ripe_first_error:
+            dns_text += f" (API errors / no data — {ripe_first_error[:80]})"
         elif ripe_failed:
             dns_text += " (API error)"
     elif ripe_summary:
