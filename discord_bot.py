@@ -106,12 +106,25 @@ _monitor_task = None
 _pending_cleanup_tasks: set[asyncio.Task] = set()
 
 
-def _cleanup_ephemeral(interaction: discord.Interaction, delay: int = EPHEMERAL_TTL_SECONDS):
-    """Schedule deletion of this interaction's original ephemeral response."""
+def _cleanup_ephemeral(target, delay: int = EPHEMERAL_TTL_SECONDS):
+    """
+    Schedule deletion of an ephemeral message after `delay` seconds.
+
+    Accepts either:
+    - a discord.Interaction whose response was sent via response.send_message
+      (uses delete_original_response)
+    - a discord.Message / WebhookMessage from a followup.send(..., wait=True)
+      call (uses message.delete() — required when defer + followup were used,
+      because delete_original_response only deletes the deferred placeholder
+      and leaves the visible followup alone)
+    """
     async def _do_delete():
         await asyncio.sleep(delay)
         try:
-            await interaction.delete_original_response()
+            if isinstance(target, discord.Interaction):
+                await target.delete_original_response()
+            else:
+                await target.delete()
         except (discord.NotFound, discord.HTTPException, AttributeError):
             # Message was already dismissed/deleted or interaction expired — fine.
             pass
@@ -305,11 +318,12 @@ async def redirect_status(interaction: discord.Interaction):
 
     data = load_redirects()
     if not data:
-        await interaction.followup.send(
+        msg = await interaction.followup.send(
             "No redirects saved yet. Run `/check-redirect` first.",
             ephemeral=True,
+            wait=True,
         )
-        _cleanup_ephemeral(interaction)
+        _cleanup_ephemeral(msg)
         return
 
     lines = []
@@ -322,7 +336,8 @@ async def redirect_status(interaction: discord.Interaction):
             updated = updated.replace("T", " ")[:16]
         lines.append(f"{geo_info['flag']} {geo_info['name']} → `{mirror}` ({method}, {updated})")
 
-    await interaction.followup.send("\n".join(lines), ephemeral=True)
+    msg = await interaction.followup.send("\n".join(lines), ephemeral=True, wait=True)
+    _cleanup_ephemeral(msg)
 
 
 # ---------------------------------------------------------------------------
@@ -358,6 +373,7 @@ async def mirror_test(interaction: discord.Interaction, url: str, geo: str):
         await interaction.response.send_message(
             f"Unknown GEO: `{geo}`.", ephemeral=True,
         )
+        _cleanup_ephemeral(interaction)
         return
 
     domain = _clean_domain(url)
