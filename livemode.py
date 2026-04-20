@@ -49,11 +49,27 @@ def main():
         subprocess.run("pkill -f discord_bot.py", shell=True, capture_output=True)
     print("  Local bots stopped.")
 
-    # 2. Lock the security group back down.
+    # 2. Start the EC2 discord-bot service. Must happen BEFORE we revoke our
+    #    own SSH rule below — otherwise we lock ourselves out mid-script.
+    print("[2/4] Starting EC2 discord-bot service...")
+    run(f'ssh -o StrictHostKeyChecking=no -i {SSH_KEY} {EC2_HOST} "sudo systemctl start discord-bot"')
+
+    # 3. Confirm it's running before locking down access.
+    print("[3/4] Verifying bot is running...")
+    status = run(
+        f'ssh -o StrictHostKeyChecking=no -i {SSH_KEY} {EC2_HOST} '
+        f'"sudo systemctl is-active discord-bot"'
+    )
+    print(f"  discord-bot status: {status}")
+    if status != "active":
+        print("  WARNING: service did not become active — leaving SG open so you can SSH and debug.")
+        return
+
+    # 4. Lock the security group back down (only after the service is up).
     #    - Port 8080: remove ALL rules (the EC2 bot uses 127.0.0.1 internally).
     #    - Port 22: remove only the current IP rule that testmode.py added —
     #      any other SSH rule (e.g. a static admin IP) is preserved.
-    print("[2/4] Closing dev access on EC2 security group...")
+    print("[4/4] Closing dev access on EC2 security group...")
     my_ip = _detect_ip()
     sg_json = run(
         f"aws ec2 describe-security-groups --region {REGION} "
@@ -89,18 +105,6 @@ def main():
                         )
                         print(f"  Removed port {SSH_PORT} rule for {target}")
     print(f"  Port {CHECKER_PORT} is now locked to localhost only.")
-
-    # 3. Start the EC2 discord-bot service.
-    print("[3/4] Starting EC2 discord-bot service...")
-    run(f'ssh -o StrictHostKeyChecking=no -i {SSH_KEY} {EC2_HOST} "sudo systemctl start discord-bot"')
-
-    # 4. Confirm it's running.
-    print("[4/4] Verifying bot is running...")
-    status = run(
-        f'ssh -o StrictHostKeyChecking=no -i {SSH_KEY} {EC2_HOST} '
-        f'"sudo systemctl is-active discord-bot"'
-    )
-    print(f"  discord-bot status: {status}")
 
     print()
     print("=" * 60)
