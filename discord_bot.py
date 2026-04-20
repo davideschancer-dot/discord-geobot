@@ -126,6 +126,11 @@ EPHEMERAL_TTL_SECONDS = 60  # 1 minute
 # Monitor background task handle (set in on_ready)
 _monitor_task = None
 
+# Strong references to in-flight cleanup tasks. asyncio.create_task() only
+# keeps a weak reference, so without this set the GC can collect the task
+# before the sleep elapses and the ephemeral never gets deleted.
+_pending_cleanup_tasks: set[asyncio.Task] = set()
+
 
 def _cleanup_ephemeral(interaction: discord.Interaction, delay: int = EPHEMERAL_TTL_SECONDS):
     """Schedule deletion of this interaction's original ephemeral response."""
@@ -137,7 +142,9 @@ def _cleanup_ephemeral(interaction: discord.Interaction, delay: int = EPHEMERAL_
             # Message was already dismissed/deleted or interaction expired — fine.
             pass
 
-    asyncio.create_task(_do_delete())
+    task = asyncio.create_task(_do_delete())
+    _pending_cleanup_tasks.add(task)
+    task.add_done_callback(_pending_cleanup_tasks.discard)
 
 
 MONITOR_PAUSE_SECONDS = 60  # how long to wait after check before restarting monitor
