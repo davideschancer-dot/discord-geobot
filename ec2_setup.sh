@@ -68,12 +68,25 @@ API_KEY = os.environ.get("REDIRECT_API_KEY", "change-me")
 CREDS_FILE = "/etc/openvpn/client/credentials.txt"
 OVPN_BASE = "https://downloads.nordcdn.com/configs/files/ovpn_udp/servers"
 
-# NordVPN server numbers differ per country — not all countries
-# have the same numbering. These were verified to exist.
+# NordVPN country IDs, used to ask the recommendations API for a
+# currently-online server. Get more via https://api.nordvpn.com/v1/countries
+COUNTRY_ID = {
+    "hu": 98,
+    "gr": 84,
+    "pl": 174,
+    "dk": 58,
+    "fr": 74,
+    "ae": 226,
+    "no": 163,
+}
+
+# Fallback server numbers, used only if the recommendations API is
+# unreachable. NordVPN retires/renumbers servers over time, so these
+# WILL go stale — the API lookup above is the primary path.
 SERVER_MAP = {
     "hu": "hu69",
     "gr": "gr69",
-    "pl": "pl150",
+    "pl": "pl231",
     "dk": "dk150",
     "fr": "fr550",
     "ae": "ae69",
@@ -87,9 +100,36 @@ def _host(url):
     return urllib.parse.urlparse(url).netloc.lower().lstrip("www.")
 
 
-def download_ovpn(country_code):
-    """Download NordVPN .ovpn config for a country if not cached."""
-    path = f"/etc/openvpn/client/{country_code}.ovpn"
+def resolve_server(country_code):
+    """Return the current recommended NordVPN hostname (e.g. 'pl231.nordvpn.com')
+    for a country. Tries the live recommendations API first, then falls back to
+    the hardcoded SERVER_MAP. Returns None if neither yields a server."""
+    cid = COUNTRY_ID.get(country_code)
+    if cid:
+        try:
+            resp = req.get(
+                "https://api.nordvpn.com/v1/servers/recommendations",
+                params={"filters[country_id]": cid, "limit": 1},
+                timeout=10,
+            )
+            data = resp.json()
+            if data and data[0].get("hostname"):
+                return data[0]["hostname"]
+        except Exception:
+            pass  # fall through to the hardcoded fallback
+
+    server = SERVER_MAP.get(country_code)
+    if server:
+        return f"{server}.nordvpn.com"
+    return None
+
+
+def download_ovpn(hostname):
+    """Download the NordVPN .ovpn config for a specific server hostname if not
+    cached. Cached per-server so a retired server's config is never reused for
+    a different one. Returns the local path, or None on failure."""
+    server = hostname.split(".")[0]
+    path = f"/etc/openvpn/client/{server}.ovpn"
     if os.path.exists(path):
         with open(path) as f:
             first_line = f.readline()
@@ -98,8 +138,7 @@ def download_ovpn(country_code):
         else:
             return path
 
-    server = SERVER_MAP.get(country_code, f"{country_code}69")
-    url = f"{OVPN_BASE}/{server}.nordvpn.com.udp.ovpn"
+    url = f"{OVPN_BASE}/{hostname}.udp.ovpn"
     result = subprocess.run(
         ["curl", "-so", path, "-w", "%{http_code}", url],
         capture_output=True, text=True,
@@ -119,13 +158,19 @@ def download_ovpn(country_code):
 
 
 def start_vpn(country_code):
-    """Start OpenVPN tunnel for the given country. Returns True if tunnel came up."""
+    """Start OpenVPN tunnel for the given country.
+    Returns (True, None) on success, or (False, reason) on failure so callers
+    can tell apart 'no server', 'config download failed', and 'tunnel timeout'."""
     subprocess.run(["killall", "openvpn"], capture_output=True)
     time.sleep(1)
 
-    ovpn_path = download_ovpn(country_code)
+    hostname = resolve_server(country_code)
+    if not hostname:
+        return False, f"no server known for '{country_code}'"
+
+    ovpn_path = download_ovpn(hostname)
     if not ovpn_path:
-        return False
+        return False, f"config download failed for {hostname}"
 
     subprocess.Popen(
         ["openvpn", "--config", ovpn_path, "--dev", "tun1"],
@@ -141,8 +186,8 @@ def start_vpn(country_code):
             subprocess.run(["ip", "route", "del", "104.24.15.0/24", "dev", "tun1"], capture_output=True)
             subprocess.run(["ip", "route", "add", "104.24.14.0/24", "dev", "tun1"], capture_output=True)
             subprocess.run(["ip", "route", "add", "104.24.15.0/24", "dev", "tun1"], capture_output=True)
-            return True
-    return False
+            return True, None
+    return False, f"tunnel to {hostname} did not come up within 20s"
 
 
 def stop_vpn():
@@ -194,8 +239,9 @@ def check():
         return jsonify({"error": "another check is in progress, try again shortly"}), 429
 
     try:
-        if not start_vpn(geo):
-            return jsonify({"error": f"VPN tunnel failed for {geo} (no config available)"}), 502
+        ok, vpn_err = start_vpn(geo)
+        if not ok:
+            return jsonify({"error": f"VPN tunnel failed for {geo}: {vpn_err}"}), 502
 
         time.sleep(1)
         mirror, err = check_redirect()
